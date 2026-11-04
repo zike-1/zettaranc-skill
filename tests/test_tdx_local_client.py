@@ -249,8 +249,9 @@ def test_wrong_directory_is_ignored(tmp_path, monkeypatch):
     assert tdx.configured_root() is None
 
 
+@pytest.mark.filterwarnings("error::DeprecationWarning")
 def test_business_days_behind_skips_weekends():
-    # 2026-10-30 是周五，2026-10-31 是周六
+    # 2026-10-30 是周五，2026-10-31 是周六；弃用警告当错误：NumPy 将来会把它变成异常
     assert business_days_behind("20261030", date(2026, 10, 31)) == 0
     assert business_days_behind("20261029", date(2026, 10, 31)) == 1
     assert business_days_behind("20261030", date(2026, 11, 2)) == 1

@@ -247,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--no-quotes", action="store_true", help="本地缺当天 K 线时不用实时行情补")
     p_report.add_argument("--no-sync", action="store_true", help="不同步到工作台「今日选股」分组")
     p_report.add_argument("--refresh-amv", action="store_true", help="先打开指南针更新活跃市值，更新完正常退出")
+    p_report.add_argument("--skip-if-current", action="store_true", help="今天休市（或还没开盘）且最近一个交易日的报告已生成时跳过；任务计划用")
 
     # ── tq-formulas / tq-select：用通达信自己的公式引擎（需要通达信开着）──
     subparsers.add_parser("tq-formulas", help="列出通达信里的自定义条件选股公式（JSON）")
@@ -376,23 +377,31 @@ def _argparse_error_message(parser: argparse.ArgumentParser, argv: list[str]) ->
 
 def cmd_report(args) -> None:
     """生成每日选股报告，写到 ``<out>/YYYY-MM-DD.html``，并把路径打印出来。"""
+    from datetime import date
     from pathlib import Path
 
-    from .daily_selection_report import write_report
+    from . import daily_selection_report as dsr
 
     blocks = tuple(name.strip() for name in args.blocks.split(",") if name.strip()) or None
+    out_dir = Path(args.out or os.environ.get("REPORT_OUT_DIR", "").strip() or "reports")
+    session = dsr.latest_session_date() if args.skip_if_current or args.refresh_amv else ""
+    if args.skip_if_current:
+        reason = dsr.skip_reason(out_dir / "data", session, date.today())
+        if reason:
+            print(f"跳过：{reason}")
+            return
     amv_refresh = None
     if args.refresh_amv:
         from dataclasses import asdict
-        from datetime import date
 
         from .zhinanzhen_refresh import refresh_amv
 
-        result = refresh_amv(f"{date.today():%Y-%m-%d}")
+        # 等最近一个交易日的活跃市值：休市日、开盘前补跑时不去等今天这份不存在的数据
+        target = f"{session[:4]}-{session[4:6]}-{session[6:]}" if session else f"{date.today():%Y-%m-%d}"
+        result = refresh_amv(target)
         amv_refresh = {**asdict(result), "updated": result.updated}
         print(f"活跃市值 {result.before} → {result.after}" + (f"（{result.error}）" if result.error else ""))
-    out_dir = Path(args.out or os.environ.get("REPORT_OUT_DIR", "").strip() or "reports")
-    path = write_report(
+    path = dsr.write_report(
         out_dir,
         amv_refresh=amv_refresh,
         sync_dsh=not args.no_sync,

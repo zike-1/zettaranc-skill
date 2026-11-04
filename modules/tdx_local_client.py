@@ -115,8 +115,10 @@ def business_days_behind(trade_date: str, today: date | None = None) -> int:
     end = today or date.today()
     if end <= start:
         return 0
-    # busday_count 含起点不含终点，平移一天后等于"起点之后到今天"的工作日数
-    return int(np.busday_count(np.datetime64(start) + 1, np.datetime64(end) + 1))
+    # busday_count 含起点不含终点，平移一天后等于"起点之后到今天"的工作日数。
+    # 单位写明是天：裸整数 +1 的写法 NumPy 已弃用，将来会直接报错。
+    one_day = np.timedelta64(1, "D")
+    return int(np.busday_count(np.datetime64(start, "D") + one_day, np.datetime64(end, "D") + one_day))
 
 
 @functools.lru_cache(maxsize=2048)

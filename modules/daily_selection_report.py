@@ -95,6 +95,8 @@ QUOTE_BATCH = 50
 QUOTE_PAUSE = 0.6
 #: 收盘后多久才补当天 K 线
 QUOTE_AFTER = (15, 5)
+#: 判断最近一个交易日用的几只沪市权重股：休市日、开盘前它们的行情时间停在上一个交易日
+SESSION_PROBES = ("600519", "601318", "600036")
 
 
 # ───────────────────────── 通达信文件（只读） ─────────────────────────
@@ -682,6 +684,47 @@ def load_history(data_dir: Path, before: str) -> list[dict]:
     return reports
 
 
+def latest_session_date(fetch=None) -> str:
+    """最近一个交易日（YYYYMMDD），按几只沪市权重股的腾讯行情时间判断；查不到返回空串。
+
+    休市日、开盘前行情时间停在上一个交易日，所以节假日返回的是节前最后一个交易日。
+    只用来决定任务计划要不要跑、活跃市值等到哪天，查不到就当不知道，不往外抛。
+    """
+    if fetch is None:
+        from modules.a_stock_data_client import tencent_quote as fetch
+    try:
+        quotes = fetch(list(SESSION_PROBES))
+    except Exception as e:  # noqa: BLE001 —— 网络、解析失败都只意味着「不知道」
+        logger.warning("查最近一个交易日失败：%s", e)
+        return ""
+    days = (str(quote.get("quote_time", ""))[:8] for quote in quotes.values())
+    return max((d for d in days if len(d) == 8 and d.isdigit()), default="")
+
+
+def report_for_session(data_dir: Path, session_date: str, recent: int = 10) -> str:
+    """最近几份报告里，数据日期是 ``session_date`` 的那份的文件日期（YYYY-MM-DD）；没有返回空串。"""
+    for day in reversed(report_days(data_dir)[-recent:]):
+        try:
+            data = json.loads((data_dir / f"{day}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if data.get("data_date") == session_date:
+            return day
+    return ""
+
+
+def skip_reason(data_dir: Path, session_date: str, today: date) -> str:
+    """任务计划用：今天没有新的交易日（休市或还没开盘），且最近一个交易日的报告已经有了，返回跳过说明。
+
+    报告按运行当天命名，休市日再跑一次会多出一份内容和上一交易日重复的报告，还要让指南针空等、
+    请求几千只股票的行情。今天是交易日、查不到最近交易日、或上一个交易日还没有报告时返回空串，照常生成。
+    """
+    if not session_date or session_date >= f"{today:%Y%m%d}":
+        return ""
+    day = report_for_session(data_dir, session_date)
+    return f"今天没有新的交易日（最近一个是 {session_date}），它的报告 {day} 已经生成" if day else ""
+
+
 def follow_up_section(history: list[dict]) -> dict:
     """历史入选的票后来怎么样：入选日收盘到第 5 / 10 个交易日收盘，等比复权；对比上证指数。"""
     from modules.tdx_local_client import local_kline_rows
@@ -695,7 +738,11 @@ def follow_up_section(history: list[dict]) -> dict:
         return rows_cache[key]
 
     entries: list[dict] = []
+    # 同一个数据日期只算一次：休市日、补跑会多出文件名不同、内容相同的报告，以后生成的为准
+    latest: dict[str, dict] = {}
     for report in history:
+        latest[report.get("data_date") or report.get("date", "")] = report
+    for report in latest.values():
         pick_date = report.get("data_date", "")
         bench = follow_up_returns(rows_of("000001.SH", "raw"), pick_date)
         for pick in report.get("picks", []):

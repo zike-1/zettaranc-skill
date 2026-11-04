@@ -2,14 +2,21 @@
 
 import json
 import struct
+from dataclasses import dataclass
+from datetime import date
 
+import pytest
+
+import modules.daily_selection_report as dsr
 from modules.daily_selection_report import (
     add_position_verdict,
     b1_streak,
     boll_position,
     flyaway_verdict,
     follow_up_returns,
+    follow_up_section,
     is_true_b1,
+    latest_session_date,
     parse_blk,
     parse_block_cfg,
     parse_block_dat,
@@ -19,6 +26,7 @@ from modules.daily_selection_report import (
     read_selection_block,
     selection_exclusion,
     sell_label,
+    skip_reason,
     weekly_closes,
 )
 from modules.dsh_watchlist_sync import picks_payload, write_picks_file
@@ -202,3 +210,85 @@ def test_selection_drops_st_sell_signals_flip_green_and_broken_yellow_line():
     assert selection_exclusion(**{**keep, "red_bricks": 5}) == "已第5块红砖"
     assert selection_exclusion(**{**keep, "macd_veto": True}) == "MACD一票否决"
     assert selection_exclusion(**{**keep, "close": 8.5}) == "跌破黄线"
+
+
+def test_latest_session_date_takes_newest_probe_quote():
+    quotes = {
+        "600519": {"quote_time": "20261231150003"},
+        "601318": {"quote_time": "20270104150002"},
+        "600036": {"quote_time": ""},
+    }
+    assert latest_session_date(lambda codes: quotes) == "20270104"
+
+
+def test_latest_session_date_is_unknown_when_quotes_fail():
+    def unreachable(codes):
+        raise OSError("timed out")
+
+    assert latest_session_date(unreachable) == ""
+
+
+def _report_json(data_dir, day, data_date, picks=()):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"date": day, "data_date": data_date, "picks": [{"code": c, "name": c} for c in picks]}
+    (data_dir / f"{day}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_skip_only_when_no_new_session_and_its_report_exists(tmp_path):
+    data = tmp_path / "data"
+    _report_json(data, "2026-12-31", "20261231")
+    holiday = date(2027, 1, 1)
+    assert "2026-12-31" in skip_reason(data, "20261231", holiday)
+    assert skip_reason(data, "20261231", date(2026, 12, 31)) == ""  # 今天就是交易日
+    assert skip_reason(data, "", holiday) == ""  # 查不到最近交易日
+    assert skip_reason(tmp_path / "none", "20261231", holiday) == ""  # 那天 20:00 没开机，还没有报告
+
+
+def test_follow_up_counts_each_data_date_once(tmp_path, monkeypatch):
+    rows = [{"trade_date": f"202612{d:02d}", "close": 10 + d} for d in range(1, 31)]
+    monkeypatch.setattr("modules.tdx_local_client.local_kline_rows", lambda code, days=0, basis="return": rows)
+    data = tmp_path / "data"
+    _report_json(data, "2026-12-10", "20261210", picks=["600000"])
+    _report_json(data, "2026-12-11", "20261210", picks=["600000"])  # 休市日多出的一份
+    section = follow_up_section(dsr.load_history(data, "2026-12-31"))
+    assert [e["code"] for e in section["entries"]] == ["600000"]
+    assert section["summary"]["5"]["count"] == 1
+
+
+def test_report_command_skips_before_opening_zhinanzhen(tmp_path, monkeypatch, capsys):
+    from modules.cli import build_parser, cmd_report
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("跳过时不该打开指南针，也不该生成报告")
+
+    monkeypatch.setattr(dsr, "latest_session_date", lambda: "20261231")
+    monkeypatch.setattr(dsr, "skip_reason", lambda data_dir, session, today: "今天休市")
+    monkeypatch.setattr(dsr, "write_report", must_not_run)
+    monkeypatch.setattr("modules.zhinanzhen_refresh.refresh_amv", must_not_run)
+    cmd_report(build_parser().parse_args(["report", "--refresh-amv", "--skip-if-current", "--out", str(tmp_path)]))
+    assert "跳过：今天休市" in capsys.readouterr().out
+
+
+@dataclass
+class _FakeRefresh:
+    before: str = ""
+    after: str = ""
+    error: str = ""
+    updated: bool = False
+
+
+@pytest.mark.parametrize("session, expected", [("20261231", "2026-12-31"), ("", None)])
+def test_amv_refresh_waits_for_latest_session(tmp_path, monkeypatch, session, expected):
+    from modules.cli import build_parser, cmd_report
+
+    targets = []
+
+    def fake_refresh(target):
+        targets.append(target)
+        return _FakeRefresh()
+
+    monkeypatch.setattr(dsr, "latest_session_date", lambda: session)
+    monkeypatch.setattr(dsr, "write_report", lambda out_dir, **kwargs: out_dir / "x.html")
+    monkeypatch.setattr("modules.zhinanzhen_refresh.refresh_amv", fake_refresh)
+    cmd_report(build_parser().parse_args(["report", "--refresh-amv", "--out", str(tmp_path)]))
+    assert targets == [expected or f"{date.today():%Y-%m-%d}"]

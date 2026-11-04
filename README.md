@@ -194,6 +194,8 @@ pip install -e ".[dev]"
 ```
 
 > 安装后注册三个命令：`zt`（CLI 主入口）、`zt-web`（FastAPI 后端）、`zt-monitor`（自选股主动监控）。不装包也可直接 `python -m modules.cli` 调用。
+>
+> **本 fork（Windows）**：请把依赖装进技能目录下的 `.venv`，步骤见下文「本地 A 股数据与每日报告」一节的「安装」。DSH 交易终端的选股页签、`scripts/daily_report.cmd` 和 SKILL.md 里的命令都只调用这里的 Python。
 
 ### 接入真实行情
 
@@ -247,10 +249,23 @@ TUSHARE_API_URL=https://api.waditu.com/dataapi
 
 | 软件 | 用途 | 必需？ |
 |---|---|---|
+| Python 3.12+ | 运行技能（装在技能目录的 `.venv` 里，见下面「安装」） | 必需 |
 | 通达信客户端（下载过盘后数据） | 日线、除权、行业、股票列表 | 每日报告必需 |
 | 通达信金融终端的 TQ 策略插件（安装目录下 `PYPlugins/sys/tqcenter.py`） | 用**通达信自己的公式引擎**跑你的选股公式 | 可选；没有时用你的 Python 版公式 |
 | 指南针（全赢决策系统） | 活跃市值 0AMV（择时） | 可选；没有时报告不显示活跃市值 |
 | [DSH 交易终端](https://github.com/zhu1090093659/dsh-trading) | 读自选里的「持仓」分组，同步「今日选股」分组 | 可选 |
+
+### 安装
+
+依赖必须装进技能目录下的 `.venv`：DSH 交易终端的选股页签、`scripts/daily_report.cmd` 和 SKILL.md 里的命令都固定调用 `.venv\Scripts\python.exe`（或 `zt.exe`），装到别处它们会找不到。在技能目录里运行（PowerShell）：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -e .
+```
+
+下文的 `python -m modules.cli …` 都指这个 `.venv` 里的 Python，即 `.venv\Scripts\python.exe -m modules.cli …`。
 
 ### 配置（`.env`）
 
@@ -282,7 +297,7 @@ python -m modules.cli report --refresh-amv   # 先打开指南针更新活跃市
 - **红利组**（电力 / 银行 / 保险）：只列当天出现 B1 的；
 - **入选后表现**：之前入选的票 5 / 10 个交易日后的涨跌，对比上证指数。
 
-用 Windows 任务计划每天收盘后调用 `scripts/daily_report.cmd`（例如工作日 20:00），日志写在 `REPORT_OUT_DIR/logs/`。
+用 Windows 任务计划每天收盘后调用 `scripts/daily_report.cmd`（例如工作日 20:00），日志写在 `REPORT_OUT_DIR/logs/`。脚本带 `--skip-if-current`：休市日（或还没开盘）且最近一个交易日的报告已经生成时直接跳过，不打开指南针，也不会多出一份和上一交易日重复的报告。最近一个交易日按几只沪市权重股的实时行情时间判断，查不到时照常生成。
 
 **数据来源与当天 K 线**：日线读本地通达信文件；当天还没下载盘后数据时，用实时行情补当天一根，按 **腾讯 → 同花顺（配置了 `HITHINK_FINANCE_API_KEY` 才用）→ 东财** 的顺序，前一家失败或没返回的才交给下一家，批量、串行、限速请求。昨收和本地对不上（可能当天除权）的不补，报告里写明。
 
