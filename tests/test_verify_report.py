@@ -80,7 +80,7 @@ def test_write_report_creates_file_at_path(tmp_path: Path):
     assert paths.json_path.exists()
     assert paths.md_path.exists()
     # JSON 文件能正确 parse
-    data = json.loads(paths.json_path.read_text())
+    data = json.loads(paths.json_path.read_text(encoding="utf-8"))
     assert data["passed_count"] == 1
     assert data["total_count"] == 2
 

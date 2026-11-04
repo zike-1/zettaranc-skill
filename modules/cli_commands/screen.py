@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from ._helpers import json_output
+from ._helpers import data_status, json_output
 from .strategy_alias import STRATEGY_ALIAS
 
 logger = logging.getLogger(__name__)
@@ -43,11 +43,16 @@ def cmd_screen(args) -> None:
     # 参数组名与 criteria 同名（simple_perfect_1/2/3 各自成组）
     param_group = criteria
 
+    meta: dict = {}
+
     def _run():
         return screen_stocks(
             criteria=criteria,
-            max_stocks=args.limit if args.limit > 0 else 0,
-            use_parallel=not args.no_parallel,
+            max_stocks=max(getattr(args, "pool", 0) or 0, 0),
+            # 参数覆盖只在当前进程生效，子进程读不到，所以覆盖时走串行
+            use_parallel=not args.no_parallel and not overrides,
+            include_st=bool(getattr(args, "include_st", False)),
+            meta=meta,
         )
 
     if overrides:
@@ -67,14 +72,21 @@ def cmd_screen(args) -> None:
     else:
         results = _run()
 
-    # limit=扫描数量；--top=返回条数（0=全部命中）
-    top = getattr(args, "top", 0) or 0
+    # --limit / --top 都是返回条数（0=全部命中）；扫描范围由 --pool 决定
+    top = getattr(args, "top", 0) or args.limit
     output_limit = top if top > 0 else len(results)
+    status = data_status(meta.get("as_of"))
 
     # ── JSON 输出 ──
     if args.json:
         json_result = {
             "criteria": criteria,
+            **status,
+            "universe": meta.get("universe"),
+            "scanned": meta.get("scanned"),
+            "skipped_stale": meta.get("skipped_stale"),
+            "skipped_st": meta.get("skipped_st"),
+            "hits": len(results),
             "count": len(results[:output_limit]),
             "stocks": [
                 {
@@ -93,9 +105,14 @@ def cmd_screen(args) -> None:
 
     # ── 人类可读输出（保持原样） ──
     print(f"\n{'=' * 60}")
-    print(f"股票筛选 (criteria={criteria}, 上限={args.limit or '全市场'})")
+    print(f"股票筛选 (criteria={criteria}, 数据源={status['data_source']}, 数据日期={status['as_of']})")
     print(f"{'=' * 60}")
-    print(f"\n扫描完成，命中: {len(results)} 只\n")
+    for warning in status["warnings"]:
+        print(f"注意: {warning}")
+    print(
+        f"\n扫描 {meta.get('scanned')} 只（股票池 {meta.get('universe')}，"
+        f"剔除无最新行情 {meta.get('skipped_stale')}、ST {meta.get('skipped_st')}），命中: {len(results)} 只\n"
+    )
 
     for r in results[:output_limit]:
         print(f"  {r.ts_code:<12} {r.name:<8} score={r.score:.1f}  {r.rating}")

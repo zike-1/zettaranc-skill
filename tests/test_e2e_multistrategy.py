@@ -219,6 +219,10 @@ class TestMultiStrategyE2E:
 
     def test_check_multi_entry_with_b1_data(self):
         """B1 场景下 _check_multi_entry 应返回 B1 信号"""
+        from modules.strategies.base_strategies import detect_b1
+
+        # 场景只有 30 根 K 线，SOP 判定算不出黄线；这里测的是信号流转
+        self.engine._sop_b1_signal = detect_b1
         klines = _generate_b1_scenario()
         idx = 14  # B1 买点日（第 15 根 K 线）
 
@@ -245,6 +249,9 @@ class TestMultiStrategyE2E:
 
     def test_score_candidate_with_real_signals(self):
         """用真实信号测试评分函数"""
+        from modules.strategies.base_strategies import detect_b1
+
+        self.engine._sop_b1_signal = detect_b1
         klines = _generate_b1_scenario()
         idx = 14  # B1 买点日
         signals = self.engine._check_multi_entry(klines, idx, ["B1"])

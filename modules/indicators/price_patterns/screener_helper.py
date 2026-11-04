@@ -234,26 +234,51 @@ def detect_b2_today(klines: list[DailyData]) -> dict:
 
 def check_two_30_rule(klines: list[DailyData]) -> dict:
     """
-    两个30%原则检查（B1筛选）
-    1. B1涨幅约30%
-    2. 累计换手率不超过30%
+    两个30%原则检查（B1筛选），规则和出处见 strategies/shaofu_rules.py
+
+    1. 建仓波涨幅：近 30 天最高价和它之前的最低价相比
+    2. 累计换手：近 30 天最大的三根阳量当天换手率相加；阳量是收盘不低于昨收或不低于开盘
+
+    数据源没有换手率时 ``b1_turnover`` 为 None，``b1_30_status`` 是"换手未知"，不会算作通过。
     """
+    from ...strategies.shaofu_rules import rule_value
+
     result: dict[str, Any] = {
         "b1_rally_pct": 0.0,
-        "b1_turnover": 0.0,
+        "b1_turnover": None,
         "b1_pass_30": False,
+        "b1_30_status": "数据不足",
     }
     if len(klines) < 10:
         return result
-    # 找最近30天的最低点作为B1起点
-    lookback = min(30, len(klines))
-    lows = [(klines[-lookback + i].low, klines[-lookback + i].close) for i in range(lookback)]
-    min_price, min_close = min(lows, key=lambda x: x[0])
-    today_close = klines[-1].close
-    rally_pct = (today_close - min_close) / min_close * 100 if min_close > 0 else 0
-    # 估算累计换手率
+
+    # 建仓波涨幅
+    window = klines[-rule_value("two_30_rally_window") :]
+    peak = max(range(len(window)), key=lambda i: window[i].high)
+    low = min(k.low for k in window[: peak + 1])
+    rally_pct = (window[peak].high / low - 1) * 100 if low > 0 else 0.0
     result["b1_rally_pct"] = round(rally_pct, 2)
-    result["b1_pass_30"] = 25 <= rally_pct <= 40
+
+    # 累计换手
+    recent = klines[-rule_value("two_30_window") :]
+    prev_closes = [klines[-len(recent) - 1].close if len(klines) > len(recent) else recent[0].close] + [k.close for k in recent[:-1]]
+    yang = [k for k, prev in zip(recent, prev_closes) if k.close >= prev or k.close >= k.open]
+    top = sorted(yang, key=lambda k: k.vol, reverse=True)[: rule_value("two_30_top_n")]
+    if not top or any(k.turnover_rate is None for k in top):
+        result["b1_30_status"] = "换手未知"
+        return result
+    turnover = sum(k.turnover_rate for k in top)  # type: ignore[misc]
+    result["b1_turnover"] = round(turnover, 2)
+
+    rally_ok = rally_pct <= rule_value("two_30_rally_pass")
+    turnover_ok = turnover <= rule_value("two_30_turnover_pass")
+    result["b1_pass_30"] = rally_ok and turnover_ok
+    if rally_pct > rule_value("two_30_rally_reject") or turnover > rule_value("two_30_turnover_reject"):
+        result["b1_30_status"] = "废B1"
+    elif rally_ok and turnover_ok:
+        result["b1_30_status"] = "通过"
+    else:
+        result["b1_30_status"] = "偏高"
     return result
 
 

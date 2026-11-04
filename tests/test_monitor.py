@@ -3,6 +3,8 @@ Z哥量化自选股监视引擎测试
 """
 
 from pathlib import Path
+
+from modules.core.paths import REPORTS_DIR
 from unittest.mock import patch, MagicMock
 from modules.watchlist import add_watch
 from modules.monitor import run_watchlist_monitor
@@ -46,7 +48,7 @@ def test_monitor_with_items(mock_notify, mock_report, mock_scan, mock_sync, temp
     assert res["summary"]["b1_count"] == 1
 
     # 验证本地报告已写盘
-    report_file = Path("data/reports/monitor_alert.md")
+    report_file = REPORTS_DIR / "monitor_alert.md"
     assert report_file.exists()
     assert "测试自选股每日报告" in report_file.read_text(encoding="utf-8")
 

@@ -147,6 +147,30 @@ class TradingGate:
             return GateAction.WAIT
 
 
+class AmvStateGate:
+    """按活跃市值多空状态的闸门：多头开仓，其余时候只卖不买。
+
+    不强制清仓：空头时已有持仓继续按离场规则处理（知识库写的是只卖不买）。
+    """
+
+    def __init__(self, allowed: dict[str, bool]) -> None:
+        self._allowed = allowed
+
+    def evaluate(self, date: str | None = None) -> GateAction:
+        """日期不在数据里时不开仓（fail-closed）。"""
+        if date is None:
+            return GateAction.WAIT
+        return GateAction.OPEN if self._allowed.get(str(date).replace("-", ""), False) else GateAction.WAIT
+
+
+def amv_state_gate() -> AmvStateGate | None:
+    """有活跃市值数据时返回闸门；没有数据返回 None。"""
+    from .active_market_value import amv_entry_filter
+
+    allowed = amv_entry_filter()
+    return AmvStateGate(allowed) if allowed else None
+
+
 def evaluate(date: str | None = None, config: GateConfig | None = None) -> GateAction:
     """闸门判定（一次性调用）。等价于 ``TradingGate(config).evaluate(date)``。"""
     return TradingGate(config).evaluate(date)

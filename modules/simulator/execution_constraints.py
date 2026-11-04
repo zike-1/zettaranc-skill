@@ -17,6 +17,7 @@ from ..indicators import DailyData
 from ..constants import (
     SIMULATOR_GEM_STAR_PRICE_LIMIT_PCT,
     SIMULATOR_MAIN_BOARD_PRICE_LIMIT_PCT,
+    SIMULATOR_ST_PRICE_LIMIT_CHANGE_DATE,
     SIMULATOR_ST_PRICE_LIMIT_PCT,
 )
 
@@ -42,17 +43,23 @@ def _is_st_name(name: str | None) -> bool:
     return "ST" in upper or "退" in name
 
 
-def _limit_pct(ts_code: str, is_st: bool) -> float:
-    """返回涨跌停幅度。"""
-    if is_st:
-        return SIMULATOR_ST_PRICE_LIMIT_PCT
+def _limit_pct(ts_code: str, is_st: bool, trade_date: str | None = None) -> float:
+    """返回涨跌停幅度。
+
+    创业板、科创板的 ST 也是 20%。主板 ST 自 2026-07-06 起与主板一致（10%），
+    之前为 5%。不传日期时按现行规则。
+    """
+    if is_st and not ts_code.startswith(("688", "689", "300", "301", "302")):
+        if trade_date and trade_date < SIMULATOR_ST_PRICE_LIMIT_CHANGE_DATE:
+            return SIMULATOR_ST_PRICE_LIMIT_PCT
+        return SIMULATOR_MAIN_BOARD_PRICE_LIMIT_PCT
     if ts_code.startswith("688") or ts_code.startswith("300") or ts_code.startswith("301"):
         return SIMULATOR_GEM_STAR_PRICE_LIMIT_PCT
     # 主板默认
     return SIMULATOR_MAIN_BOARD_PRICE_LIMIT_PCT
 
 
-def _price_limits(prev_close: float, ts_code: str, is_st: bool) -> tuple[float, float]:
+def _price_limits(prev_close: float, ts_code: str, is_st: bool, trade_date: str | None = None) -> tuple[float, float]:
     """基于上一交易日收盘价计算涨停价与跌停价。
 
     交易所口径为四舍五入到分（ROUND_HALF_UP）；Python 内置 round 是
@@ -60,7 +67,7 @@ def _price_limits(prev_close: float, ts_code: str, is_st: bool) -> tuple[float, 
     浮点下 round 得 9.13，交易所实际跌停价为 9.14），因此用 Decimal。
     """
     price = Decimal(str(prev_close))
-    pct = Decimal(str(_limit_pct(ts_code, is_st)))
+    pct = Decimal(str(_limit_pct(ts_code, is_st, trade_date)))
     cent = Decimal("0.01")
     limit = (price * (Decimal("1") + pct)).quantize(cent, rounding=ROUND_HALF_UP)
     floor = (price * (Decimal("1") - pct)).quantize(cent, rounding=ROUND_HALF_UP)
@@ -93,7 +100,7 @@ def is_price_limit_hit(kline: DailyData, prev_close: float, ts_code: str) -> tup
         (是否涨停, 原因说明)
     """
     is_st = _is_st_name(getattr(kline, "name", None))
-    limit, _ = _price_limits(prev_close, ts_code, is_st)
+    limit, _ = _price_limits(prev_close, ts_code, is_st, getattr(kline, "trade_date", None))
     if kline.close >= limit:
         return True, f"涨停（涨停价 {limit:.2f}）"
     return False, ""
@@ -147,7 +154,7 @@ def get_trade_constraints(
         )
 
     prev_close = prev_kline.close
-    limit, floor = _price_limits(prev_close, ts_code, is_st)
+    limit, floor = _price_limits(prev_close, ts_code, is_st, getattr(kline, "trade_date", None))
 
     # 买入：若开盘价 >= 涨停价，视为无法买入
     can_buy = kline.open < limit

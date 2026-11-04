@@ -15,6 +15,7 @@ import pytest
 # 19 个 strategy 中文别名（与 cli.STRATEGY_ALIAS 保持同步）
 EXPECTED_STRATEGIES = [
     "B1",
+    "少妇B1",
     "B2",
     "B3",
     "完美图形",
@@ -74,7 +75,7 @@ def test_strategy_alias_covers_all_sixteen():
     """STRATEGY_ALIAS 必须覆盖 19 种 strategy"""
     from modules.cli import STRATEGY_ALIAS
 
-    assert len(STRATEGY_ALIAS) == 19
+    assert len(STRATEGY_ALIAS) == 20
     for name in EXPECTED_STRATEGIES:
         assert name in STRATEGY_ALIAS, f"STRATEGY_ALIAS 缺 {name}"
 
@@ -121,7 +122,7 @@ def test_web_api_reuses_cli_strategy_alias():
         pytest.skip("api 依赖未安装")
 
     assert screen_service.STRATEGY_ALIAS is STRATEGY_ALIAS
-    assert len(screen_service.STRATEGY_ALIAS) == 19
+    assert len(screen_service.STRATEGY_ALIAS) == 20
 
 
 @pytest.mark.parametrize("chinese_name", EXPECTED_STRATEGIES)
@@ -129,7 +130,7 @@ def test_screen_parser_accepts_all_strategies(chinese_name, fake_screen_result, 
     """main() parser 必须接受全部 strategy 中文别名"""
     from modules.cli import main
 
-    test_args = ["zt", "screen", "--strategy", chinese_name, "--limit", "5", "--no-parallel"]
+    test_args = ["zt", "screen", "--strategy", chinese_name, "--pool", "5", "--no-parallel"]
 
     with (
         patch.object(sys, "argv", test_args),
@@ -147,7 +148,7 @@ def test_screen_parser_accepts_all_strategies(chinese_name, fake_screen_result, 
     # 3. use_parallel 应该是 False（因为传了 --no-parallel）
     assert call_kwargs["use_parallel"] is False
 
-    # 4. max_stocks 应该是 5（不是 args.limit 默认 20）
+    # 4. 扫描数量由 --pool 决定
     assert call_kwargs["max_stocks"] == 5
 
     # 5. 输出包含 ts_code + score + rating
@@ -179,11 +180,11 @@ def test_screen_calls_screen_stocks_not_self_loop(fake_screen_result, capsys):
     )
 
 
-def test_screen_limit_zero_means_full_market(fake_screen_result, capsys):
-    """--limit 0 表示扫全市场（pass max_stocks=0 给 screen_stocks）"""
+def test_screen_limit_is_output_count_not_scan_size(fake_screen_result, capsys):
+    """--limit 只控制返回条数，默认扫全市场（max_stocks=0）"""
     from modules.cli import main
 
-    test_args = ["zt", "screen", "--strategy", "B1", "--limit", "0", "--no-parallel"]
+    test_args = ["zt", "screen", "--strategy", "B1", "--limit", "1", "--no-parallel"]
 
     with (
         patch.object(sys, "argv", test_args),
@@ -192,7 +193,7 @@ def test_screen_limit_zero_means_full_market(fake_screen_result, capsys):
         main()
 
     call_kwargs = mock_screen.call_args.kwargs
-    assert call_kwargs["max_stocks"] == 0, "limit=0 必须透传给 max_stocks=0"
+    assert call_kwargs["max_stocks"] == 0, "--limit 不能缩小扫描范围"
 
 
 # ==================== cmd_watchlist scan 修复验证 ====================

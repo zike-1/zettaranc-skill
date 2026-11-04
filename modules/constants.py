@@ -83,7 +83,7 @@ STATISTICS_SIGNIFICANCE_ALPHA = 0.05
 # ---------------------------------------------------------------------------
 
 # 候选池涨幅分位数默认值（取前 30%）
-POOL_DEFAULT_TOP_RETURN_PCT = 0.30
+POOL_DEFAULT_TOP_RETURN_PCT = None  # 不按最新涨幅筛选：回测时用结果选样本等于提前知道答案
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +116,9 @@ SIMULATOR_DEFAULT_SLIPPAGE = 0.05
 SIMULATOR_MAIN_BOARD_PRICE_LIMIT_PCT = 0.10
 
 # A 股 ST/*ST 单日涨跌幅限制
-SIMULATOR_ST_PRICE_LIMIT_PCT = 0.05
+SIMULATOR_ST_PRICE_LIMIT_PCT = 0.05  # 主板风险警示股，2026-07-06 之前
+# 《上海证券交易所交易规则（2026 年修订）》及深交所同步修订：2026-07-06 起主板风险警示股调整为 10%
+SIMULATOR_ST_PRICE_LIMIT_CHANGE_DATE = "20260706"
 
 # A 股创业板 / 科创板 单日涨跌幅限制
 SIMULATOR_GEM_STAR_PRICE_LIMIT_PCT = 0.20

@@ -16,6 +16,8 @@ _CRITERIA_REGISTRY: dict[str, CriteriaFn] = {}
 
 logger = logging.getLogger(__name__)
 
+GENERIC_B1_J_LIMIT = 13
+
 
 def _register(name: str):
     """装饰器：注册筛选条件处理函数"""
@@ -60,7 +62,26 @@ def _check_sandglass_min(klines, min_score: int = 50) -> bool:
 
 @_register("b1")
 def _criteria_b1(klines, score: "StockScore") -> bool:
-    return score.b1_score >= 50
+    """通用 B1：J 值必须打到 13 以下（知识库 03-买卖信号/B1建仓波.md:24），再看综合评分。"""
+    from ..indicators import calculate_kdj
+
+    return calculate_kdj(klines)[2] < GENERIC_B1_J_LIMIT and score.b1_score >= 50
+
+
+@_register("shaofu_b1")
+def _criteria_shaofu_b1(klines, score: "StockScore") -> bool:
+    """少妇战法 B1：与回测引擎同一套入场规则（J≤-10、白线在黄线上、缩量、N 型）。"""
+    from ..strategies.shaofu_b1 import detect_shaofu_b1
+    from ..strategies.shaofu_rules import rule_value
+
+    return (
+        detect_shaofu_b1(
+            klines,
+            j_threshold=rule_value("j_threshold"),
+            vol_shrink_threshold=rule_value("vol_shrink_threshold"),
+        )
+        is not None
+    )
 
 
 @_register("perfect")

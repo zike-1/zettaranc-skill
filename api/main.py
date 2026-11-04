@@ -113,10 +113,11 @@ def start_web():
     print(f"  地址: http://127.0.0.1:{settings.api_port}")
     print("  请打开 React 前端项目 (npm run dev) 进行数据可视化浏览")
     print("=" * 60)
-    uvicorn.run("api.main:app", host="0.0.0.0", port=settings.api_port, reload=False)
+    # 接口没有鉴权，只监听本机。要让局域网访问，需要先加鉴权
+    uvicorn.run("api.main:app", host="127.0.0.1", port=settings.api_port, reload=False)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api.main:app", host="0.0.0.0", port=settings.api_port, reload=True)
+    uvicorn.run("api.main:app", host="127.0.0.1", port=settings.api_port, reload=True)

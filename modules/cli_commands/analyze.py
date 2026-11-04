@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import sys
 
-from ._helpers import error, json_output
+from modules.core.errors import ErrorCode, ZettarancError
+
+from ._helpers import data_status, error, json_output
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,14 @@ def analyze_core(ts_code: str, days: int = 120) -> dict:
     from modules.strategies.core import get_kline_data as _strat_get_klines  # 返回 dict
     from modules.portfolio_diagnosis import diagnose_stock
     from modules.screener import analyze_stock as screener_analyze
+
+    # analyze_stock 只读本地，未入库的股票先同步；仍然没有就明确报错，不输出全 0 的结果
+    if not _strat_get_klines(ts_code, days=1):
+        from modules.data_sync import DataSyncer
+
+        DataSyncer().sync_daily_kline(ts_code)
+        if not _strat_get_klines(ts_code, days=1):
+            raise ZettarancError(ErrorCode.DATA_SOURCE_ERROR, f"{ts_code} 没有 K 线数据，请检查代码或数据源")
 
     # 1. 指标分析
     result = analyze_stock(ts_code, days=days)
@@ -98,6 +108,7 @@ def cmd_analyze(args) -> None:
         json_result = {
             "ts_code": ts_code,
             "name": getattr(diagnosis, "name", ts_code),
+            **data_status(result.trade_date),
             "price": getattr(diagnosis, "price", 0),
             "indicators": {
                 "kdj": {"k": result.k, "d": result.d, "j": result.j},
@@ -119,6 +130,12 @@ def cmd_analyze(args) -> None:
             "kirin": {
                 "phase": kirin_data["stage"] if kirin_data else "未知",
                 "confidence": kirin_data["confidence"] if kirin_data else 0,
+            },
+            "two_30": {
+                "rally_pct": result.b1_rally_pct,
+                "turnover": result.b1_turnover,
+                "pass": result.b1_pass_30,
+                "status": result.b1_30_status,
             },
             "strategies": [
                 {
@@ -240,6 +257,7 @@ def cmd_score(args) -> None:
         json_result = {
             "ts_code": score.ts_code,
             "name": score.name,
+            **data_status(core["result"].trade_date),
             "score": score.score,
             "b1_score": score.b1_score,
             "trend_score": score.trend_score,

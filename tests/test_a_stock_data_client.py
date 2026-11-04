@@ -196,12 +196,15 @@ class TestCodeConversion:
         assert _get_market_code("830799") == 0
 
     def test_get_prefix(self):
-        """行情前缀：6/9->sh，8->bj，其余->sz"""
+        """行情前缀：5/6/9->sh，4/8/92->bj，其余->sz"""
         assert _get_prefix("600519") == "sh"
         assert _get_prefix("688981") == "sh"
         assert _get_prefix("830799") == "bj"
         assert _get_prefix("000001") == "sz"
         assert _get_prefix("300750") == "sz"
+        assert _get_prefix("588200") == "sh"  # 沪市 ETF
+        assert _get_prefix("159915") == "sz"
+        assert _get_prefix("920985") == "bj"
 
 
 # ==================== 腾讯财经实时行情 ====================
@@ -652,9 +655,10 @@ class TestAStockDataClient:
         assert df["trade_date"].tolist() == ["20260721", "20260722"]
 
     def test_get_daily_fallback_mootdx(self, client):
-        """百度无数据时回退 mootdx"""
+        """百度、腾讯无数据时回退 mootdx"""
         with (
             patch("modules.a_stock_data_client.baidu_kline_to_dataframe", return_value=None),
+            patch("modules.a_stock_data_client.tencent_kline_to_dataframe", return_value=None),
             patch("modules.a_stock_data_client._mootdx_kline", return_value=_make_kline_df()),
         ):
             df = client.get_daily("600519.SH")
@@ -663,9 +667,10 @@ class TestAStockDataClient:
         assert (df["ts_code"] == "600519.SH").all()
 
     def test_get_daily_baidu_exception_fallback(self, client):
-        """百度解析抛异常时回退 mootdx，不向上抛错"""
+        """百度解析抛异常、腾讯无数据时回退 mootdx，不向上抛错"""
         with (
             patch("modules.a_stock_data_client.baidu_kline_to_dataframe", side_effect=RuntimeError("解析失败")),
+            patch("modules.a_stock_data_client.tencent_kline_to_dataframe", return_value=None),
             patch("modules.a_stock_data_client._mootdx_kline", return_value=_make_kline_df()),
         ):
             df = client.get_daily("600519.SH")
@@ -673,12 +678,41 @@ class TestAStockDataClient:
         assert len(df) == 3
 
     def test_get_daily_all_fail_returns_none(self, client):
-        """百度与 mootdx 都无数据时返回 None"""
+        """百度、腾讯与 mootdx 都无数据时返回 None"""
         with (
             patch("modules.a_stock_data_client.baidu_kline_to_dataframe", return_value=None),
+            patch("modules.a_stock_data_client.tencent_kline_to_dataframe", return_value=None),
             patch("modules.a_stock_data_client._mootdx_kline", return_value=None),
         ):
             assert client.get_daily("600519.SH") is None
+
+    def test_get_daily_fallback_tencent(self, client):
+        """百度无数据时回退腾讯，不再走 mootdx；字段顺序与单位对齐 tushare"""
+        resp = MagicMock()
+        resp.json.return_value = {
+            "data": {
+                "sh600519": {
+                    "qfqday": [
+                        ["2026-07-21", "10.0", "11.0", "12.0", "9.0", "100.0"],
+                        ["2026-07-22", "11.0", "12.1", "13.0", "10.0", "200.0", {"extra": 1}],
+                    ]
+                }
+            }
+        }
+        with (
+            patch("modules.a_stock_data_client.baidu_kline_to_dataframe", return_value=None),
+            patch("modules.a_stock_data_client.requests.get", return_value=resp),
+            patch("modules.a_stock_data_client._mootdx_kline") as mock_mootdx,
+        ):
+            df = client.get_daily("600519.SH")
+        mock_mootdx.assert_not_called()
+        assert df["trade_date"].tolist() == ["20260721", "20260722"]
+        assert df["close"].tolist() == [11.0, 12.1]
+        assert df["high"].tolist() == [12.0, 13.0]
+        assert df["low"].tolist() == [9.0, 10.0]
+        assert df["amount"].iloc[1] == pytest.approx(242.0)
+        assert df["pct_chg"].iloc[1] == pytest.approx(10.0)
+        assert (df["ts_code"] == "600519.SH").all()
 
     def test_get_index_daily(self, client):
         """指数日线：百度 K 线 + 日期过滤；无数据返回 None"""
@@ -688,7 +722,10 @@ class TestAStockDataClient:
         assert len(df) == 2
         assert (df["ts_code"] == "000001.SH").all()
 
-        with patch("modules.a_stock_data_client.baidu_kline_to_dataframe", return_value=None):
+        with (
+            patch("modules.a_stock_data_client.baidu_kline_to_dataframe", return_value=None),
+            patch("modules.a_stock_data_client.tencent_kline_to_dataframe", return_value=None),
+        ):
             assert client.get_index_daily("000001.SH") is None
 
     # ---------- get_realtime_quote ----------

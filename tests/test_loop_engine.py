@@ -193,13 +193,20 @@ class TestCheckLuZhu:
     """卤煮止盈测试"""
 
     def test_lu_zhu_triggered(self):
-        """在白线之上 + 连续 2 根阳线 → 卤煮触发"""
+        """离场线之上 + 连续 2 根 4% 以上的阳线 → 卤煮触发"""
         engine = ShaofuLoopEngine()
-        white_line = 100.0
-        candle1 = make_kline(price=102.0, prev_close=100.0)
-        candle2 = make_kline(price=104.0, prev_close=102.0)
-        recent_klines = [candle1, candle2]
-        assert engine.check_lu_zhu(recent_klines, white_line) is True
+        line = 100.0
+        candle1 = make_kline(price=105.0, open=101.0, prev_close=100.0, pct_chg=5.0)
+        candle2 = make_kline(price=110.0, open=106.0, prev_close=105.0, pct_chg=4.8)
+        assert engine.check_lu_zhu([candle1, candle2], line) is True
+
+    def test_lu_zhu_small_yang_not_triggered(self):
+        """两根小阳线不算中大阳线"""
+        engine = ShaofuLoopEngine()
+        line = 100.0
+        candle1 = make_kline(price=102.0, open=101.0, prev_close=100.0, pct_chg=2.0)
+        candle2 = make_kline(price=104.0, open=103.0, prev_close=102.0, pct_chg=1.96)
+        assert engine.check_lu_zhu([candle1, candle2], line) is False
 
     def test_lu_zhu_not_triggered(self):
         """在白线之上但只有 1 根阳线 → 未触发"""

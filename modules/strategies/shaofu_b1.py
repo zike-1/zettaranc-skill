@@ -104,10 +104,10 @@ def detect_shaofu_b1(
     if j_val > j_threshold:
         return None
 
-    # --- 3. 牛绳检查：白线在黄线上才入场 ---
+    # --- 3. 牛绳检查：白线在黄线上才入场。黄线不足 114 根时返回 0，不能当作满足条件 ---
     white = calculate_zg_white(klines)
     yellow = calculate_dg_yellow(klines)
-    if white < yellow:
+    if yellow <= 0 or white < yellow:
         return None
 
     # --- 4. 缩量回调 ---

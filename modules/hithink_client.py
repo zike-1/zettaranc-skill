@@ -70,6 +70,30 @@ def _normalize_thscode(ts_code: str) -> str:
     return f"{m.group(1)}.{m.group(2)}" if m else ""
 
 
+def _to_thscode(code: str) -> str:
+    """6 位代码补交易所后缀（沪 5/6/9，北 4/8/92，其余深）。"""
+    if code.startswith(("4", "8", "92")):
+        return f"{code}.BJ"
+    if code.startswith(("5", "6", "9")):
+        return f"{code}.SH"
+    return f"{code}.SZ"
+
+
+def snapshot_session_date(ready: datetime, trading_days: list[str]) -> str:
+    """同花顺快照的 ``data.timestamp`` 是取数时间，不是交易日（2026-11-04 07:44 取到的是 11-03 的行情）。
+    按交易日历换算：交易日 15:00 后 → 当天；开盘（9:15）前或非交易日 → 上一个交易日；盘中 → 空串（日线未完成）。
+    """
+    day = ready.strftime("%Y%m%d")
+    hhmm = ready.hour * 100 + ready.minute
+    if day in trading_days:
+        if hhmm >= 1500:
+            return day
+        if hhmm >= 915:
+            return ""
+    earlier = [d for d in trading_days if d < day]
+    return earlier[-1] if earlier else ""
+
+
 def _derive_market(thscode: str) -> str:
     """按代码规则推断板块名（与 a_stock_data 客户端口径一致，补充北交所）"""
     code = thscode.split(".")[0]
@@ -319,6 +343,48 @@ class HithinkFinanceClient:
             for item in (data or {}).get("item") or []:
                 merged[item.get("thscode", "")] = item
         return merged
+
+    def quote_bars(self, codes: list[str]) -> dict[str, dict]:
+        """行情快照 → 与 a_stock_data_client.tencent_quote 同口径的 dict（6 位代码为键）。
+
+        官方文档字段：``volume`` 成交量（股）、``turnover`` 成交额（元）、``data.timestamp``
+        为整批快照的就绪时间（毫秒），据此判断是不是当天。未配置 Key 时返回空 dict。
+        """
+        result: dict[str, dict] = {}
+        if not self.is_configured:
+            return result
+        trading_days = self._trading_days()
+        if not trading_days:
+            raise OSError("同花顺交易日历取不到，无法判断快照属于哪个交易日")
+        thscodes = [c for c in (_normalize_thscode(x if "." in x else _to_thscode(x)) for x in codes) if c]
+        for chunk in self._chunks(thscodes):
+            data = self._get("/api/a-share/prices/snapshot", {"thscodes": ",".join(chunk)})
+            if data is None:
+                raise OSError("同花顺行情快照请求失败")
+            stamp = data.get("timestamp")
+            day = snapshot_session_date(datetime.fromtimestamp(stamp / 1000, tz=_TZ_SH), trading_days) if stamp else ""
+            # 盘中快照不是完整日线：quote_time 留空，调用方按「没有时间」跳过
+            when = f"{day}150000" if day else ""
+            for item in data.get("item") or []:
+                code = str(item.get("ticker") or item.get("thscode", "")[:6])
+                result[code] = {
+                    "price": float(item.get("last_price") or 0),
+                    "last_close": float(item.get("prev_price") or 0),
+                    "open": float(item.get("open_price") or 0),
+                    "high": float(item.get("high_price") or 0),
+                    "low": float(item.get("low_price") or 0),
+                    "volume_lots": float(item.get("volume") or 0) / 100,
+                    "amount_wan": float(item.get("turnover") or 0) / 10000,
+                    "quote_time": when,
+                }
+        return result
+
+    def _trading_days(self) -> list[str]:
+        """近一年交易日 YYYYMMDD（上游固定返回今日往前一年）；进程内缓存。"""
+        if getattr(self, "_trading_days_cache", None) is None:
+            cal = self.get_trade_cal()
+            self._trading_days_cache = sorted(cal["cal_date"].tolist()) if cal is not None else []
+        return self._trading_days_cache
 
     def get_realtime_quote(self, ts_codes: list[str]) -> pd.DataFrame | None:
         """获取实时行情快照（快照行情 + 估值快照合并出 name/PE/PB）"""

@@ -9,9 +9,10 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Optional
 
-from ..active_market_gate import GateAction, TradingGate
+from ..active_market_gate import AmvStateGate, GateAction, TradingGate
 from ..core.metrics import calc_curve_metrics, calc_trade_stats
 from ..core.market_context import MarketRegime
 from ..indicators import DailyData, get_kline_data
@@ -25,6 +26,7 @@ from ..simulator.market_context import precompute_market_contexts
 # 多策略检测函数（延迟导入避免循环依赖）
 from ..strategies.base_strategies import detect_b1, detect_b2, detect_sb1
 from ..strategies.compound_strategies import detect_changan
+from ..strategies.shaofu_b1 import detect_shaofu_b1
 from modules.core.errors import ErrorCode, ZettarancError
 
 logger = logging.getLogger(__name__)
@@ -99,7 +101,7 @@ class PortfolioConfig:
     min_composite_score: float = 0.3
     # 活跃市值（0AMV）全局闸门 port：OPEN 才允许开仓，CLEAR 强制清仓。
     # None 表示闸门不存在（等价关闭）。由调用方注入，engine 不自己造。
-    gate: TradingGate | None = None
+    gate: TradingGate | AmvStateGate | None = None
     # v3.10.0：按市场环境分组的策略权重（键: STRONG / NEUTRAL / WEAK）
     # 若某环境未配置则退回 strategy_weights
     regime_strategy_weights: dict[str, dict[str, float]] = field(
@@ -121,6 +123,7 @@ class Position:
     entry_date: str
     cost_basis: float  # 含手续费的总成本
     trade: LoopTrade  # 当前持仓交易对象
+    partial_done: int = 0  # 已经入账的减半次数
 
 
 @dataclass
@@ -361,7 +364,8 @@ class PortfolioBacktestEngine:
             # 活跃市值全局闸门：CLEAR 强制清仓，非 OPEN 禁止新开仓
             active_mv_allow_new = True
             if config.gate is not None:
-                active_mv_gate = config.gate.evaluate(date)
+                # 用昨日的活跃市值决定今日开盘的动作，当日数据收盘才有
+                active_mv_gate = config.gate.evaluate(prev_date or date)
                 if active_mv_gate is GateAction.CLEAR:
                     cash = self._force_close_all_active_mv(
                         date=date,
@@ -461,7 +465,7 @@ class PortfolioBacktestEngine:
         klines_map: dict[str, list[DailyData]] = {}
         for code in ts_codes:
             try:
-                klines = get_kline_data(code, days)
+                klines = get_kline_data(code, days, basis="return")
                 if klines and len(klines) >= 30:
                     klines_map[code] = klines
             except Exception as e:  # noqa: BLE001
@@ -520,7 +524,7 @@ class PortfolioBacktestEngine:
             )
 
             if completed is not None:
-                # 平仓：按收盘价卖出
+                # 平仓：昨日收盘判定、今日开盘成交（成交价已含滑点）
                 exit_price = completed.exit_price
                 sell_amount = pos.shares * exit_price
                 commission = max(
@@ -533,8 +537,34 @@ class PortfolioBacktestEngine:
             else:
                 # 更新持仓交易对象（止损位等可能变化）
                 pos.trade = updated_trade  # type: ignore[assignment]
+                cash = self._settle_partial_sells(pos, cash)
 
         return cash
+
+    def _settle_partial_sells(self, pos: Position, cash: float) -> float:
+        """把新发生的减半卖出记到账户上（A 股按整百股卖）。"""
+        config = self.portfolio_config
+        for leg in pos.trade.partial_exits[pos.partial_done :]:
+            shares = int(pos.shares * 0.5 / 100) * 100
+            if shares <= 0:
+                continue
+            amount = shares * leg["price"]
+            cash += amount - max(config.min_commission, amount * config.commission_rate) - amount * config.stamp_duty_rate
+            pos.shares -= shares
+        pos.partial_done = len(pos.trade.partial_exits)
+        return cash
+
+    def _sop_b1_signal(self, klines: list[DailyData], idx: int) -> Any | None:
+        """少妇战法 B1：组合引擎和单股回测用同一套入场规则。"""
+        facts = detect_shaofu_b1(
+            self.loop_engine._prefix(klines, idx),
+            j_threshold=self.loop_config.j_threshold,
+            vol_shrink_threshold=self.loop_config.vol_shrink_threshold,
+        )
+        if facts is None:
+            return None
+        reason = f"J={facts['j_value']:.1f}, 振幅={facts['b1_amplitude']:.1f}%, 评分={facts['b1_score']}"
+        return SimpleNamespace(action="BUY", confidence=min(1.0, 0.5 + facts["b1_score"] * 0.1), reason=reason, description=reason)
 
     def _check_multi_entry(
         self,
@@ -559,7 +589,7 @@ class PortfolioBacktestEngine:
                 continue
             detect_fn, _default_weight = detector
             try:
-                sig = detect_fn(klines, idx)
+                sig = self._sop_b1_signal(klines, idx) if strategy_name == "B1" else detect_fn(klines, idx)
             except Exception:  # noqa: BLE001
                 continue
             if sig is None:
@@ -623,13 +653,16 @@ class PortfolioBacktestEngine:
         cash: float,
         completed_trades: list[LoopTrade],
     ) -> float:
-        """活跃市值 CLEAR 时强制清仓所有持仓，返回更新后的现金。"""
+        """活跃市值 CLEAR 时强制清仓所有持仓，返回更新后的现金。
+
+        闸门用昨日数据判定，所以这里按今日开盘价成交。
+        """
         for code in list(positions.keys()):
             pos = positions[code]
             idx = date_index_map.get(code, {}).get(date)
             if idx is None:
                 continue
-            price = klines_map[code][idx].close
+            price = klines_map[code][idx].open * (1 - self.loop_config.slippage_pct)
             sell_amount = pos.shares * price
             commission = max(self.portfolio_config.min_commission, sell_amount * self.portfolio_config.commission_rate)
             stamp_duty = sell_amount * self.portfolio_config.stamp_duty_rate
@@ -639,7 +672,7 @@ class PortfolioBacktestEngine:
             pos.trade.exit_price = price
             pos.trade.exit_reason = "活跃市值清仓"
             if pos.trade.entry_price > 0:
-                pos.trade.pnl_pct = (price - pos.trade.entry_price) / pos.trade.entry_price * 100.0
+                pos.trade.pnl_pct = self.loop_engine.net_pnl_pct(pos.trade, price)
             completed_trades.append(pos.trade)
             del positions[code]
         return cash
@@ -654,7 +687,7 @@ class PortfolioBacktestEngine:
         net_value: float,
         prev_context: MarketContext | None = None,
     ) -> float:
-        """扫描多策略信号并买入，返回更新后的现金
+        """用昨日收盘的信号在今日开盘买入，返回更新后的现金
 
         支持多策略并行检测，按综合评分（置信度 × 策略权重 + 共振奖励）排序。
         prev_context 为上一交易日市场环境，用于自适应仓位控制。
@@ -680,12 +713,12 @@ class PortfolioBacktestEngine:
                 continue
             idx = date_index_map.get(code, {}).get(date)
             min_days = self.portfolio_config.min_signal_days
-            if idx is None or idx < min_days:
+            if idx is None or idx - 1 < min_days:
                 continue
 
-            # 多策略检测
-            signals = self._check_multi_entry(klines, idx, enabled)
-            if not signals:
+            # 多策略检测（昨日收盘的信号）
+            signals = self._check_multi_entry(klines, idx - 1, enabled)
+            if not signals or self.loop_engine.is_limit_up_open(klines, idx):
                 continue
 
             composite_score = self._score_candidate(signals, weights)
@@ -703,7 +736,7 @@ class PortfolioBacktestEngine:
         max_new = min(eff_max_entries, available_slots)
         for code, signals, score in candidates[:max_new]:
             idx = date_index_map[code][date]
-            price = klines_map[code][idx].close
+            price = klines_map[code][idx].open * (1 + self.loop_config.slippage_pct)
 
             # 目标仓位金额
             target_amount = net_value * eff_position_pct
@@ -735,8 +768,15 @@ class PortfolioBacktestEngine:
             # v3.10.0：记录所有触发的策略（按置信度排序，用 + 连接）
             all_strategies = "+".join(s.strategy for s in sorted(signals, key=lambda x: x.confidence, reverse=True))
 
-            # 创建 LoopTrade 持仓对象
-            stop_loss = best_signal.stop_loss_price
+            # 创建 LoopTrade 持仓对象。止损基于买入 K 线，从这根收盘开始检查
+            stop_loss = _calc_stop_loss_price(
+                klines_map[code],
+                idx,
+                self.loop_config.stop_loss_method,
+                self.loop_config.stop_loss_pct,
+                atr_multiplier=self.loop_config.atr_stop_multiplier,
+                atr_window=self.loop_config.atr_stop_window,
+            )
             trade = LoopTrade(
                 ts_code=code,
                 entry_date=date,
@@ -745,6 +785,7 @@ class PortfolioBacktestEngine:
                 stop_loss_price=stop_loss,
                 position_pct=self.loop_config.position_pct,
                 strategy_source=all_strategies,
+                entry_index=idx,
             )
 
             positions[code] = Position(

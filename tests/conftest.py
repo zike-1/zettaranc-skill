@@ -3,6 +3,7 @@
 提供临时数据库 fixture 和测试数据工厂
 """
 
+import gc
 import os
 import sys
 import tempfile
@@ -13,6 +14,22 @@ from pathlib import Path
 # 确保项目根目录在 path 中
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# modules.core.paths 在 import 时读 DATA_DIR，必须赶在导入任何模块之前设好。
+# 否则 registry 和报告会写进真实数据目录，下次运行时 LoopConfig.from_registry 还会读到它们。
+os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="zt-test-")
+# 留空而不是删除：测试里起的子进程会读 .env，删除后开发者本机的配置又会生效
+os.environ["TDX_DIR"] = ""
+os.environ["ZHINANZHEN_DATA_DIR"] = ""
+
+
+def utf8_child_env() -> dict[str, str]:
+    """子进程环境：开 Python UTF-8 模式，配合 subprocess.run(encoding="utf-8") 读输出。
+
+    CLI 的 --help 走控制台编码（中文 Windows 上是 GBK），JSON 输出却固定 UTF-8，
+    不统一的话父进程总有一边解码失败。调用时取当前 os.environ，带上 autouse fixture 设的变量。
+    """
+    return {**os.environ, "PYTHONUTF8": "1"}
 
 
 @pytest.fixture(autouse=True)
@@ -37,11 +54,15 @@ def mock_env_for_tests():
             ):
                 del os.environ[key]
         os.environ.update(env_vars)
+        os.environ["TDX_DIR"] = ""
+        os.environ["ZHINANZHEN_DATA_DIR"] = ""
         # 每次测试清空 bridge 健康缓存，隔离 patch _http_get 的 auto 测试（不触发 set_bridge_config）
         from modules import bridge_client
 
         bridge_client.reset_bridge_health_cache()
         yield db_path
+        # `with sqlite3.connect()` 只提交不关闭；Windows 上没关的连接会锁住 test.db，删临时目录失败
+        gc.collect()
 
 
 @pytest.fixture

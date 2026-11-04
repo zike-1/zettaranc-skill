@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import utf8_child_env
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -124,7 +126,8 @@ def test_thin_shell_has_help(script):
     result = subprocess.run(
         [sys.executable, str(PROJECT_ROOT / script), "--help"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        env=utf8_child_env(),
         timeout=15,
     )
     # argparse 默认 --help 退出 0

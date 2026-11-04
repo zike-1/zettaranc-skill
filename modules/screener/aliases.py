@@ -9,6 +9,7 @@ from __future__ import annotations
 # CLI 中文别名 → screener 英文 criteria 的统一映射
 STRATEGY_ALIAS: dict[str, str] = {
     "B1": "b1",
+    "少妇B1": "shaofu_b1",
     "B2": "b2_breakout",
     "B3": "b3_consensus",
     "完美图形": "perfect",

@@ -54,9 +54,9 @@ def test_evaluate_no_data_is_wait_fail_closed():
     assert result is GateAction.WAIT
 
 
-def test_evaluate_date_not_in_index_is_wait():
+def test_evaluate_date_not_in_index_is_wait(tmp_path):
     """日期不在索引里 → WAIT。"""
-    csv_path = _write_csv(Path("/tmp"), _ROWS)
+    csv_path = _write_csv(tmp_path, _ROWS)
     try:
         result = evaluate("20260901", GateConfig(enabled=True, path=csv_path))
         assert result is GateAction.WAIT

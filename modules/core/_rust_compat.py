@@ -13,7 +13,7 @@
         return calculate_atr(klines, 14)
 
 环境变量：
-    ZETTARANC_BACKTEST_IMPL = "rust"（默认）| "python" | "auto"
+    ZETTARANC_BACKTEST_IMPL = "python"（默认）| "rust" | "auto"
         rust   - 强制使用 Rust
         python - 强制使用 Python（跳过 _core_compute 导入）
         auto   - 优先 Rust；导入失败则降级 Python
@@ -27,7 +27,9 @@ from typing import Literal
 
 ImplChoice = Literal["rust", "python", "auto"]
 
-_DEFAULT_IMPL: ImplChoice = "rust"
+# 默认走 Python：Rust 引擎的默认参数和离场规则还没有按知识库更新，
+# 同一条命令走 Rust 会是另一套策略。需要时显式设 ZETTARANC_BACKTEST_IMPL=rust。
+_DEFAULT_IMPL: ImplChoice = "python"
 
 
 def get_impl_choice() -> ImplChoice:

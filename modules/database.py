@@ -6,6 +6,7 @@
 import logging
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 from collections.abc import Generator
@@ -61,13 +62,33 @@ if not _db_path.is_absolute():
 DB_PATH = _db_path.resolve()
 
 
+def _dir_is_writable(path: Path) -> bool:
+    """实际写一下才算数：Windows 沙箱里 os.access 判断不出 ACL 拒绝。目录还不存在时交给后面的 mkdir。"""
+    if not path.exists():
+        return True
+    try:
+        with tempfile.TemporaryFile(dir=path):
+            return True
+    except OSError:
+        return False
+
+
 def get_db_path() -> Path:
-    """获取数据库路径（每次调用时动态读取 DB_PATH 环境变量；纯 getter，无 mkdir 副作用）"""
+    """获取数据库路径（每次调用时动态读取 DB_PATH 环境变量；不建目录）。
+
+    配置的目录不可写时（比如在终端的沙箱里运行）改用临时目录的库：K 线读通达信，不依赖它，
+    但临时库里没有自选、跟踪等本地记录。
+    """
     path_str = os.getenv("DB_PATH", "data/stock_data.db")
     path = Path(path_str)
     if not path.is_absolute():
         path = Path(__file__).parent.parent / path_str
-    return path.resolve()
+    path = path.resolve()
+    if _dir_is_writable(path.parent):
+        return path
+    fallback = Path(tempfile.gettempdir()) / "zettaranc" / path.name
+    logger.warning("[database] %s 不可写，改用临时数据库 %s，本地记录不可用", path.parent, fallback)
+    return fallback
 
 
 def get_db_connection() -> sqlite3.Connection:

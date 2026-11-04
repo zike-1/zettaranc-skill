@@ -381,6 +381,8 @@ def _run_portfolio_engine_branch(
     meta: dict,
 ) -> VerifyResult:
     """v3.7.6 组合引擎分支"""
+    from modules.active_market_gate import amv_state_gate
+
     from .portfolio_engine import PortfolioBacktestEngine, PortfolioConfig
 
     config = config or LoopConfig()
@@ -388,7 +390,9 @@ def _run_portfolio_engine_branch(
         initial_capital=1_000_000.0,
         max_positions=5,
         position_pct=config.position_pct,
+        gate=amv_state_gate(),
     )
+    meta["timing"] = "活跃市值多头才开仓" if pc.gate is not None else "未择时"
     engine = PortfolioBacktestEngine(portfolio_config=pc, loop_config=config)
     pb_result = engine.run(ts_codes, days=days)
 
@@ -425,7 +429,11 @@ def _run_portfolio_engine_branch(
 
     from .gates import check_gates
 
-    gates = check_gates(aggregate, wf=wf_result)
+    baseline = _random_entry_baseline(engine, pb_result.trades, days)
+    if baseline is not None:
+        meta["random_entry_baseline"] = baseline.to_dict()
+
+    gates = check_gates(aggregate, wf=wf_result, baseline=baseline)
 
     return VerifyResult(
         per_stock=per_stock,
@@ -433,6 +441,23 @@ def _run_portfolio_engine_branch(
         gates=gates,
         config_used=_config_to_dict(config),
         meta=meta,
+    )
+
+
+def _random_entry_baseline(engine, trades: list[LoopTrade], days: int):
+    """算随机入场对照；没有交易或取不到 K 线时返回 None。"""
+    from .baseline import random_entry_baseline
+
+    codes = sorted({t.ts_code for t in trades})
+    if not codes:
+        return None
+    loop_engine = engine.loop_engine
+    slippage = engine.loop_config.slippage_pct
+    return random_entry_baseline(
+        engine._load_klines(codes, days),
+        trades,
+        buy_cost=loop_engine._buy_cost() + slippage,
+        sell_cost=loop_engine._sell_cost() + slippage,
     )
 
 

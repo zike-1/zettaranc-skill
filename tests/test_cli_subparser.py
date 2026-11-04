@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import utf8_child_env
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -22,7 +24,8 @@ def run_zt(*args: str, timeout: int = 15) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "modules.cli", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        env=utf8_child_env(),
         timeout=timeout,
         cwd=str(PROJECT_ROOT),
     )

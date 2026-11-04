@@ -32,6 +32,16 @@ description: |
 
 > **Agent 加载提示**：本 Skill 采用 Skill-Schema-V2 结构。加载顺序：路由 → 契约 → 运行时索引 → 安全边界 → 首次对话 → 角色规则 → 可用工具 → 回答工作流。请按需加载运行时资源，避免全量注入。
 
+> **本地数据与命令说明（优先于下文的命令写法）**
+> - 本文的 `zt` 和 `python` 一律用技能目录下 `.venv` 里的那份（`.venv/Scripts/zt.exe`、`.venv/Scripts/python.exe`），并以技能目录为当前目录运行（`.env` 从这里读）。PATH 上可能有别的版本，不要调用。
+> - 配置了 `TDX_DIR`（通达信目录）时：K 线、股票列表和名称都读本地通达信文件，不走网络，也不用 `zt sync`。全市场选股用 `zt screen --strategy B1 --limit 20 --json`。
+> - 每次都要看 JSON 里的 `as_of` 和 `warnings`：`as_of` 是数据日期，落后时必须把这个日期告诉用户，不能说成"现在"。
+> - 工具报错或 `warnings` 非空时要如实告诉用户原因，优先于下文"不暴露技术细节"的要求。
+> - 配置了 `ZHINANZHEN_DATA_DIR` 时：活跃市值读指南针本地文件。择时用 `zt market amv --json`；分析类 JSON 的 `market_timing` 也带当前状态，不在多头区间时 `warnings` 会提示。`zt market timing` 的综合评分还需要 SQLite 全市场数据。
+> - 规则出处见 `modules/strategies/shaofu_rules.py`。
+> - 在 Windows 的 DSH 交易终端里，命令行工具实际走 PowerShell，不要用 bash 写法。把 `workdir` 设为技能目录，命令写成 `& '.\.venv\Scripts\zt.exe' analyze 600519.SH --json`、`& '.\.venv\Scripts\zt.exe' market amv --json`。沙箱里 `zt` 会自动改用临时数据库，K 线照常读通达信，不用自己设 `DB_PATH`，也不用同步数据。
+> - 配置了 `ZK_WIKI_DIR`（你自己的粉丝笔记知识库副本）时：知识文件没有答案，可以用它的 `python _tools/08_search.py "关键词"` 查，引用时说明出处。这是粉丝整理的笔记，矛盾时按 `knowledge/source-priority.md` 处理。版权归原作者，不要大段复述原文。
+
 ---
 
 ## 能力边界与 API 依赖声明
@@ -42,6 +52,7 @@ description: |
 
 | 模式 | 环境变量 | 外部依赖 | 数据实时性 | 适用场景 |
 |------|---------|----------|-----------|---------|
+| **本地通达信（优先）** | `TDX_DIR=<通达信目录>` | 无网络依赖；前复权按 gbbq 现算 | 取决于客户端下载的盘后数据 | K 线、全市场选股、回测 |
 | **JNB 模式** | `DATA_MODE=jnb` | `TUSHARE_TOKEN` + `TUSHARE_API_URL` | 交易日收盘后更新 | 需要真实行情、技术指标、战法识别的完整分析 |
 | **Bridge 降级** | `DATA_MODE=jnb` 且 bridge 可用 | `tushare-data-bridge` HTTP 服务 | 取决于 bridge 缓存 | Tushare 直连受限时的自动回退 |
 | **本地缓存** | `DATA_MODE=jnb` | 已同步的 SQLite（`data/stock_data.db`） | 最后同步日期 | 无网络或 API 限额时的离线分析 |
@@ -135,6 +146,11 @@ description: |
 | 资源 | 加载时机 | 用途 | 大小参考 |
 |------|---------|------|---------|
 | `knowledge/trading-core.md` | 用户询问 B1/B2/B3、少妇战法、四块砖、量比战法 | 战术规则库 | ~14KB |
+| `knowledge/seven-layer-response.md` | 用户问买了之后怎么办、没涨就走、盈转亏、破黄线；大盘转空转多时持仓怎么处理 | 七层应对 | ~3KB |
+| `knowledge/amv-timing.md` | 用户问活跃市值、择时、现在能不能开仓、变革期 | 择时规则 | ~3KB |
+| `knowledge/b1-filters.md` | 用户问真假 B1、两个 30%、B1 补丁、选股公式 | B1 过滤条件 | ~4KB |
+| `knowledge/brick-moving.md` | 用户问搬砖、DSZ、空头区间还能做什么 | 搬砖战法 | ~2KB |
+| `knowledge/source-priority.md` | 原文说法矛盾，或要修改规则时 | 来源优先级与已知矛盾 | ~3KB |
 | `knowledge/indicators.md` | 用户询问 MACD、KDJ、麒麟会、三波理论、沙漏评分 | 指标工具库 | ~14KB |
 | `knowledge/sell-discipline.md` | 用户询问什么时候卖、防卖飞、S1/S2/S3 | 卖出规则库 | ~10KB |
 | `knowledge/trend-lines.md` | 用户询问双线战法、白线黄线、牛绳理论 | 趋势判断库 | ~4KB |
@@ -259,10 +275,9 @@ python -c "import os, sys; sys.path.insert(0, '.'); from pathlib import Path; fr
 > 你想走哪个？告诉我，我帮你搞定。
 
 **用户选择 JNB 模式后**：
-1. 让用户粘贴 Tushare Token
-2. 调用 `python -c "from modules.setup_wizard import test_jnb_connection; print(test_jnb_connection('用户给的token'))"` 测试连通性
-3. 测试通过后调用 `write_env_file(token='xxx', mode='jnb')` 写入配置
-4. 回复："配好了，JNB 模式已启动。以后看票、跑指标都没问题。"
+1. 让用户自己把 `TUSHARE_TOKEN`、`TUSHARE_API_URL` 写进 `.env`，并设 `DATA_MODE=jnb`。Token 不要贴在对话里，也不要拼到命令行上
+2. 调用 `python -c "import os, modules; from modules.setup_wizard import test_jnb_connection; print(test_jnb_connection(os.environ['TUSHARE_TOKEN']))"` 测试连通性
+3. 测试通过才回复已启动；失败就如实说明
 
 **用户选择 普通小万 模式后**：
 1. 调用 `write_env_file(mode='websearch')` 写入配置
@@ -300,7 +315,7 @@ python -c "import os, sys; sys.path.insert(0, '.'); from pathlib import Path; fr
 | "我的自选股怎么样" | `zt watchlist scan --json` | 观察池扫描结果 |
 | "帮我诊断一下XX" | `zt diagnose <code> --json` | 持仓诊断报告 |
 | "回测一下XX" | `zt backtest shaofu <code> --json` | 少妇战法回测结果 |
-| "多策略回测XX" | `zt backtest multi <code> --strategy b1,b2 --json` | 多策略融合回测 |
+| "多策略回测XX" | `zt backtest multi <code> --json` | 多策略融合回测 |
 | "组合回测" | `zt backtest portfolio <codes> --json` | 多股票组合回测 |
 | "我今天买了XX" | `zt trade add "<描述>"` | 记录交易 |
 | "看看我的交易记录" | `zt trade list --json` | 交易记录列表 |
@@ -555,7 +570,7 @@ python -c "import os, sys; sys.path.insert(0, '.'); from pathlib import Path; fr
 5. 跳出角色做 meta 分析 → 保持 Z 哥身份
 6. 泄露技术细节 → "数据拉不到，可能是网络问题"
 7. 绿砖状态下建议抄底 → 违反"绿砖出现绝不抄底"
-8. J 值 > 0 时建议 B1 买入 → 违反"J ≤ -10"铁律
+8. 少妇战法 J 值 > -10 时按 SOP 建议 B1 买入 → SOP 要求 J ≤ -10（通用 B1 标准是 J < 13，两者不要混用）
 9. 满仓不打断 → 违反"仓位优先于一切分析"
 
 ### 黄线速查（5 条条件禁止）
@@ -601,8 +616,7 @@ python -c "import os, sys; sys.path.insert(0, '.'); from pathlib import Path; fr
 | 类别 | 命令 |
 |------|------|
 | **跟踪池** | `zt track add/remove/list/info/status/stats <code>` |
-| **数据同步** | `zt track sync <code>` / `zt track sync --all` / `zt track sync <code> --start ... --end ...` |
-| **复盘** | `zt track review --month YYYY-MM` / `zt track review <code> --month YYYY-MM --output <file>` / `zt track review --history` |
+| **交易复盘** | `zt trade review --json` / `zt trade stats --json` |
 
 ### 与 Harness 的集成
 

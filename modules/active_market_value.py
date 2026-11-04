@@ -178,6 +178,14 @@ def _index_duckdb_cached(duckdb_path: str, mtime: float) -> dict[str, ActiveMark
     return _build_index(_load_duckdb_cached(duckdb_path, mtime))
 
 
+def _compass_points() -> list[ActiveMarketValuePoint] | None:
+    """配置了指南针目录时返回活跃市值序列（文件读取已按修改时间缓存）。"""
+    from .compass_vdat import read_amv_rows
+
+    rows = read_amv_rows()
+    return _finalize_points(rows) if rows else None
+
+
 def clear_cache() -> None:
     """显式清空所有 0AMV 缓存（测试/CSV 热重载时调用）。"""
     _load_csv_cached.cache_clear()
@@ -191,8 +199,13 @@ def _load_index_and_rows(
 ) -> tuple[list[ActiveMarketValuePoint], dict[str, ActiveMarketValuePoint]]:
     """返回 (rows, date→point 索引)。O(1) 查找用索引，需要 idx 算 cum 用 rows。
 
+    没有显式指定数据源时优先读指南针本地文件（配置 ZHINANZHEN_DATA_DIR）。
     优先 DuckDB，失败/空时回退 CSV。两边都按 (path, mtime) 缓存，文件变更自动失效。
     """
+    if not path and not duckdb_path:
+        local = _compass_points()
+        if local:
+            return local, {p.date: p for p in local}
     if duckdb_path:
         mtime = _safe_mtime(duckdb_path)
         try:
@@ -222,6 +235,10 @@ def load_active_market_value(
     Returns:
         按日期升序的活跃市值点列表。
     """
+    if not path and not duckdb_path:
+        local = _compass_points()
+        if local:
+            return local
     if duckdb_path:
         try:
             mtime = _safe_mtime(duckdb_path)
@@ -276,6 +293,82 @@ def get_active_market_signal(
     if point.pct_chg <= down_threshold:
         return "DOWN"
     return "NEUTRAL"
+
+
+@dataclass(frozen=True)
+class MarketState:
+    """活跃市值多空状态。"""
+
+    date: str  # YYYY-MM-DD
+    state: str  # BULL / BEAR / UNKNOWN
+    pct_chg: float
+    two_day_sum: float
+    since: str  # 当前状态从哪天开始
+
+
+def market_states(points: list[ActiveMarketValuePoint]) -> list[MarketState]:
+    """按用户文档的口径逐日计算多空状态。
+
+    - 单日变化率 >= +4%，或连续两日变化率算术相加 >= +4% → 多头
+    - 单日变化率 <= -2.3% → 空头，且优先于两日多头条件
+    - 其余情况延续上一状态
+    """
+    states: list[MarketState] = []
+    state = "UNKNOWN"
+    since = ""
+    prev_close: float | None = None
+    prev_pct: float | None = None
+    for point in points:
+        pct = (point.close / prev_close - 1.0) * 100.0 if prev_close else None
+        two_day = pct + prev_pct if pct is not None and prev_pct is not None else None
+        new_state = state
+        if pct is not None:
+            if pct <= SIGNAL_THRESHOLDS.down:
+                new_state = "BEAR"
+            elif pct >= SIGNAL_THRESHOLDS.up or (two_day is not None and two_day >= SIGNAL_THRESHOLDS.up):
+                new_state = "BULL"
+        if new_state != state:
+            state = new_state
+            since = point.date
+        states.append(MarketState(point.date, state, round(pct or 0.0, 4), round(two_day or 0.0, 4), since))
+        prev_close = point.close
+        prev_pct = pct
+    return states
+
+
+def next_day_triggers(state: MarketState) -> dict[str, float | None]:
+    """下一交易日单日变化率到多少会翻转状态，当前状态已是那一方时为 None。
+
+    转多：>= ``next_day_bull_at``；转空：<= ``next_day_bear_at``。今天跌时两日条件比单日
+    条件更难，门槛取单日的 +4%。
+    """
+    bull_at = min(SIGNAL_THRESHOLDS.up, SIGNAL_THRESHOLDS.up - state.pct_chg)
+    return {
+        "next_day_bull_at": None if state.state == "BULL" else round(bull_at, 4),
+        "next_day_bear_at": None if state.state == "BEAR" else SIGNAL_THRESHOLDS.down,
+    }
+
+
+def current_market_state() -> MarketState | None:
+    """最新的多空状态；没有活跃市值数据时返回 None。"""
+    try:
+        states = market_states(load_active_market_value())
+    except (OSError, ValueError) as e:
+        logging.getLogger(__name__).debug("读取活跃市值失败: %s", e)
+        return None
+    return states[-1] if states else None
+
+
+def amv_entry_filter() -> dict[str, bool] | None:
+    """择时结果 {YYYYMMDD: 能否开仓}：多头区间才开仓。没有数据时返回 None。"""
+    try:
+        states = market_states(load_active_market_value())
+    except (OSError, ValueError) as e:
+        logging.getLogger(__name__).debug("读取活跃市值失败: %s", e)
+        return None
+    if not states:
+        return None
+    return {s.date.replace("-", ""): s.state == "BULL" for s in states}
 
 
 def format_active_market_value(point: ActiveMarketValuePoint) -> str:

@@ -25,12 +25,15 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 from modules.core.rate_limit import wait_min_interval
 
 logger = logging.getLogger(__name__)
+
+_TZ_SH = ZoneInfo("Asia/Shanghai")
 
 
 # ---------------------------------------------------------------------------
@@ -68,13 +71,12 @@ def _get_market_code(code: str) -> int:
 
 
 def _get_prefix(code: str) -> str:
-    """6 位代码 -> 市场前缀 (sh/sz/bj)"""
-    if code.startswith(("6", "9")):
-        return "sh"
-    elif code.startswith("8"):
+    """6 位代码 -> 市场前缀 (sh/sz/bj)；口径同 tdx_local_client.to_symbol（沪市 ETF 5 开头，北交所 4/8/92 开头）"""
+    if code.startswith(("4", "8", "92")):
         return "bj"
-    else:
-        return "sz"
+    if code.startswith(("5", "6", "9")):
+        return "sh"
+    return "sz"
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +189,8 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
             "price": float(vals[3]) if vals[3] else 0,
             "last_close": float(vals[4]) if vals[4] else 0,
             "open": float(vals[5]) if vals[5] else 0,
+            "volume_lots": float(vals[6]) if vals[6] else 0,
+            "quote_time": vals[30],  # YYYYMMDDHHMMSS，休市日停在最后一个交易日
             "change_amt": float(vals[31]) if vals[31] else 0,
             "change_pct": float(vals[32]) if vals[32] else 0,
             "high": float(vals[33]) if vals[33] else 0,
@@ -203,6 +207,57 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
             "vol_ratio": float(vals[49]) if vals[49] else 0,
             "pe_static": float(vals[52]) if vals[52] else 0,
         }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 东财 — 批量实时行情（腾讯不可用时的备用）
+# ---------------------------------------------------------------------------
+
+_EM_ULIST_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+_EM_QUOTE_FIELDS = "f12,f2,f5,f6,f15,f16,f17,f18,f124"
+_EM_QUOTE_BATCH = 50
+
+
+def _em_num(value: Any) -> float:
+    """东财停牌字段为 "-"，按 0 处理。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def eastmoney_quote(codes: list[str]) -> dict[str, dict]:
+    """批量拉东财实时行情，字段口径与 tencent_quote 一致（成交量手、成交额万元、quote_time 为 YYYYMMDDHHMMSS）。
+
+    2026-11-03 核对：f5 成交量单位为手（国电电力 1414253 与腾讯一致），f6 成交额单位为元，
+    f124 为 Unix 秒级更新时间，停牌股价量字段为 "-"。
+    """
+    result: dict[str, dict] = {}
+    plain = [_ts_code_to_6digit(c) if "." in c else c for c in codes]
+    for start in range(0, len(plain), _EM_QUOTE_BATCH):
+        batch = plain[start : start + _EM_QUOTE_BATCH]
+        secids = ",".join(f"{1 if _get_prefix(c) == 'sh' else 0}.{c}" for c in batch)
+        r = _em_get(_EM_ULIST_URL, params={"fltt": "2", "invt": "2", "fields": _EM_QUOTE_FIELDS, "secids": secids}, timeout=10)
+        if r is None:
+            raise OSError("东财行情请求失败")
+        try:
+            rows = ((r.json() or {}).get("data") or {}).get("diff") or []
+        except ValueError as e:
+            raise ValueError(f"东财行情 JSON 解析失败: {e}") from e
+        for row in rows:
+            code = str(row.get("f12", ""))
+            ts = int(_em_num(row.get("f124")))
+            result[code] = {
+                "price": _em_num(row.get("f2")),
+                "last_close": _em_num(row.get("f18")),
+                "open": _em_num(row.get("f17")),
+                "high": _em_num(row.get("f15")),
+                "low": _em_num(row.get("f16")),
+                "volume_lots": _em_num(row.get("f5")),
+                "amount_wan": _em_num(row.get("f6")) / 10000,
+                "quote_time": datetime.fromtimestamp(ts, tz=_TZ_SH).strftime("%Y%m%d%H%M%S") if ts else "",
+            }
     return result
 
 
@@ -442,6 +497,58 @@ def stock_fund_flow_120d(code: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 腾讯财经 — K线备用数据源（本机补丁，见 INSTALL_NOTES.md）
+# ---------------------------------------------------------------------------
+
+
+def tencent_kline_to_dataframe(ts_code: str, days: int = 500, tries: int = 3) -> pd.DataFrame | None:
+    """腾讯前复权日K转 DataFrame，列名对齐 tushare daily 格式。
+
+    接口不返回成交额，amount 按 vol(手) × close 近似换算为千元。
+    返回 DataFrame 或 None（无数据时）。
+    """
+    num, _, exchange = ts_code.partition(".")
+    if not num or not exchange:
+        return None
+    symbol = f"{exchange.lower()}{num}"
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    params = {"param": f"{symbol},day,,,{days},qfq"}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+
+    # 本机代理偶发断连，单次失败不代表接口不可用
+    payload = None
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            r.raise_for_status()
+            payload = r.json()
+            break
+        except (requests.RequestException, ValueError) as e:
+            logger.debug("[a-stock-data] 腾讯 K 线第 %d 次失败 %s: %s", attempt + 1, ts_code, e)
+            time.sleep(0.8 * (attempt + 1))
+    if not isinstance(payload, dict):
+        return None
+
+    data = payload.get("data")
+    node = data.get(symbol) if isinstance(data, dict) else None
+    if not isinstance(node, dict):
+        return None
+    # 个股返回 qfqday，指数返回 day
+    rows = node.get("qfqday") or node.get("day") or []
+    if not rows:
+        return None
+
+    df = pd.DataFrame([row[:6] for row in rows], columns=["trade_date", "open", "close", "high", "low", "vol"])
+    for col in ["open", "high", "low", "close", "vol"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["amount"] = df["vol"] * df["close"] / 10
+    df["pct_chg"] = df["close"].pct_change() * 100
+    df.loc[df.index[0], "pct_chg"] = 0.0
+    df["trade_date"] = df["trade_date"].str.replace("-", "")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # mootdx (通达信 TCP) — K线备用数据源
 # ---------------------------------------------------------------------------
 
@@ -523,23 +630,24 @@ class AStockDataClient:
         end_date: str | None = None,
     ) -> pd.DataFrame | None:
         """获取个股日线行情（OHLCV + 涨跌幅）。
-        数据源优先级：百度股市通 -> mootdx (通达信 TCP)
+        数据源优先级：百度股市通 -> 腾讯财经 -> mootdx (通达信 TCP)
         """
         code = _ts_code_to_6digit(ts_code)
         if not code:
             return None
 
+        days = 500
+        if start_date and end_date:
+            try:
+                d1 = datetime.strptime(start_date, "%Y%m%d")
+                d2 = datetime.strptime(end_date, "%Y%m%d")
+                days = max((d2 - d1).days + 30, 60)
+            except ValueError:
+                pass
+
         # 1. 尝试百度 K 线
         self._rate_limit()
         try:
-            days = 500
-            if start_date and end_date:
-                try:
-                    d1 = datetime.strptime(start_date, "%Y%m%d")
-                    d2 = datetime.strptime(end_date, "%Y%m%d")
-                    days = max((d2 - d1).days + 30, 60)
-                except ValueError:
-                    pass
             df = baidu_kline_to_dataframe(code, days=days)
             if df is not None and not df.empty:
                 df["ts_code"] = ts_code
@@ -550,9 +658,21 @@ class AStockDataClient:
                 if not df.empty:
                     return df
         except Exception as e:
-            logger.debug("[a-stock-data] 百度 K 线失败 %s: %s, 尝试 mootdx", ts_code, e)
+            logger.debug("[a-stock-data] 百度 K 线失败 %s: %s, 尝试腾讯", ts_code, e)
 
-        # 2. 回退到 mootdx (通达信 TCP)
+        # 2. 回退到腾讯财经
+        self._rate_limit()
+        df = tencent_kline_to_dataframe(ts_code, days=days)
+        if df is not None:
+            df["ts_code"] = ts_code
+            if start_date:
+                df = df[df["trade_date"] >= start_date]
+            if end_date:
+                df = df[df["trade_date"] <= end_date]
+            if not df.empty:
+                return df
+
+        # 3. 回退到 mootdx (通达信 TCP)
         self._rate_limit()
         try:
             df = _mootdx_kline(code, days=500)
@@ -575,13 +695,15 @@ class AStockDataClient:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> pd.DataFrame | None:
-        """获取指数日线行情 — 百度K线也支持指数"""
+        """获取指数日线行情 — 百度K线也支持指数，失败时回退腾讯财经"""
         code = _ts_code_to_6digit(ts_code)
         if not code:
             return None
         self._rate_limit()
         try:
             df = baidu_kline_to_dataframe(code, days=500)
+            if df is None or df.empty:
+                df = tencent_kline_to_dataframe(ts_code, days=500)
             if df is None or df.empty:
                 return None
             df["ts_code"] = ts_code

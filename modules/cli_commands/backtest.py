@@ -10,7 +10,9 @@ from ..active_market_gate import GateConfig, TradingGate
 from ..backtest.portfolio import portfolio_result_to_dict
 from ..backtest.single import multi_strategy_result_to_dict
 from ..backtest.shaofu import shaofu_result_to_dict
-from ._helpers import error, json_output, warn
+from modules.active_market_gate import amv_state_gate
+
+from ._helpers import data_status, error, json_output, warn
 from .simulate import cmd_simulate
 
 logger = logging.getLogger(__name__)
@@ -127,8 +129,28 @@ def cmd_backtest(args) -> None:
             error("请指定股票代码，如: backtest shaofu 600487.SH", as_json=use_json)
 
         from modules.backtest._rust_bridge import bridge_shaofu_single
+        from modules.core.errors import ErrorCode, ZettarancError
+        from modules.indicators import get_kline_data
 
-        dict_result = bridge_shaofu_single(ts_code, days=days)
+        klines = get_kline_data(ts_code, days, basis="return")
+        if not klines:
+            raise ZettarancError(
+                ErrorCode.BACKTEST_EMPTY_KLINES,
+                f"{ts_code} 没有 K 线数据。配置 TDX_DIR，或先运行 zt sync sync {ts_code}",
+            )
+        # SOP 第一步择时：有活跃市值数据就用，--no-timing 可关闭
+        market_filter = None
+        if not getattr(args, "no_timing", False):
+            from modules.active_market_value import amv_entry_filter
+
+            market_filter = amv_entry_filter()
+        if market_filter is None:
+            dict_result = bridge_shaofu_single(ts_code, days=days, klines=klines)
+        else:
+            dict_result = bridge_shaofu_single(ts_code, days=days, klines=klines, market_filter=market_filter)
+        dict_result.update(data_status(klines[-1].trade_date))
+        dict_result["bars"] = len(klines)
+        dict_result["timing"] = "活跃市值多头才开仓" if market_filter is not None else "未择时"
 
         if dict_result.get("total_trades", 0) == 0:
             warn(f"{ts_code} 在 {days} 天内无交易记录（数据不足或无信号触发）")
@@ -178,8 +200,8 @@ def cmd_backtest(args) -> None:
             initial_capital=1_000_000.0,
             max_positions=5,
             position_pct=lc_cfg.position_pct,
-            # 闸门默认关闭（验收与 CLI 一致）
-            gate=None,
+            # 有活跃市值数据就按多空状态择时（验收与 CLI 一致）
+            gate=amv_state_gate(),
         )
         engine = PortfolioBacktestEngine(portfolio_config=pc, loop_config=lc_cfg)
         result_port = engine.run(ts_codes, days=days)

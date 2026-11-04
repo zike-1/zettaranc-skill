@@ -25,6 +25,7 @@ from .hithink_client import HithinkFinanceClient
 from .indevs_client import IndevsClient
 from .tushare_client import TushareClient
 from .a_stock_data_client import AStockDataClient
+from .tdx_local_client import TdxLocalClient, configured_root
 from modules.core.errors import ErrorCode, ZettarancError
 from modules.datasource_resolution import resolve_provider
 
@@ -465,6 +466,77 @@ class HithinkFinanceDataSource:
         return self._client.get_kline_dicts(ts_code, days, start_date, end_date)
 
 
+class TdxLocalDataSource:
+    """本地通达信盘后数据（只读，不走网络）。
+
+    只提供 K 线、证券信息和交易日历。盘中快照、资金流等本地文件里没有的数据返回 None，
+    由组合数据源回退到其他源。
+    """
+
+    def __init__(self, root: str | None = None) -> None:
+        self._client = TdxLocalClient(root)
+
+    @property
+    def name(self) -> str:
+        """数据源标识名"""
+        return "tdx-local"
+
+    def health_check(self) -> bool:
+        """本地上证指数日线可读即视为可用"""
+        return self._client.latest_trade_date() is not None
+
+    def get_daily(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+        """前复权日线（通达信口径）"""
+        return self._client.get_daily(ts_code, start_date, end_date)
+
+    def get_index_daily(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+        """指数日线"""
+        return self._client.get_index_daily(ts_code, start_date, end_date)
+
+    def get_realtime_quote(self, ts_codes: list[str]) -> pd.DataFrame | None:
+        """本地盘后数据没有盘中快照"""
+        return None
+
+    def get_moneyflow(self, ts_code: str, trade_date: str) -> pd.DataFrame | None:
+        """本地盘后数据没有资金流"""
+        return None
+
+    def get_daily_basic(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+        """本地没有逐日换手率与估值"""
+        return None
+
+    def get_stk_factor(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+        """本地没有 Tushare 技术因子"""
+        return None
+
+    def get_stock_basic(self, ts_code: str | None = None, name: str | None = None) -> pd.DataFrame | None:
+        """证券基础信息"""
+        return self._client.get_stock_basic(ts_code, name)
+
+    def get_trade_cal(self, exchange: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+        """用上证指数的 K 线日期作为交易日历"""
+        dates = [
+            d for d in self._client.trade_dates() if (not start_date or d >= start_date) and (not end_date or d <= end_date)
+        ]
+        if not dates:
+            return None
+        return pd.DataFrame({"exchange": exchange or "SSE", "cal_date": dates, "is_open": 1})
+
+    def get_stock_list(self, exchange: str | None = None) -> list[dict]:
+        """本地全部 A 股个股"""
+        return self._client.get_stock_list(exchange)
+
+    def get_kline_dicts(
+        self,
+        ts_code: str,
+        days: int = 60,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict]:
+        """前复权 K 线（通达信口径）"""
+        return self._client.get_kline_dicts(ts_code, days=days, start_date=start_date, end_date=end_date)
+
+
 class SqliteDataSource:
     """本地 SQLite 数据源封装。"""
 
@@ -599,7 +671,7 @@ class CompositeDataSource:
     行为不变，不会被静默切换。
     """
 
-    VALID_PREFERRED = ("auto", "hithink", "tushare", "indevs", "bridge", "sqlite", "a-stock-data")
+    VALID_PREFERRED = ("auto", "tdx", "hithink", "tushare", "indevs", "bridge", "sqlite", "a-stock-data")
 
     def __init__(self, preferred: str = "auto") -> None:
         if preferred not in self.VALID_PREFERRED:
@@ -614,6 +686,17 @@ class CompositeDataSource:
         self._indevs: IndevsDataSource | None = None
         self._a_stock_data: AStockDataDataSource | None = None
         self._hithink: HithinkFinanceDataSource | None = None
+        self._tdx: TdxLocalDataSource | None = None
+
+    @property
+    def _tdx_source(self) -> TdxLocalDataSource:
+        if self._tdx is None:
+            self._tdx = TdxLocalDataSource()
+        return self._tdx
+
+    def _reads_local_tdx(self) -> bool:
+        """K 线是否直接读本地通达信（此时不走 SQLite 缓存，前复权始终是最新基准）。"""
+        return self._preferred == "tdx" or (self._preferred == "auto" and configured_root() is not None)
 
     @property
     def _tushare_source(self) -> TushareDataSource:
@@ -648,6 +731,8 @@ class CompositeDataSource:
         零配置返回 None（由调用方回退 a-stock-data）。
         """
         resolution = resolve_provider()
+        if resolution.provider == "tdx":
+            return self._tdx_source
         if resolution.provider == "hithink":
             return self._hithink_source
         if resolution.provider == "indevs":
@@ -675,6 +760,8 @@ class CompositeDataSource:
         p = self._preferred
         if p == "auto":
             return self._auto_sources()
+        if p == "tdx":
+            return [self._tdx_source, self._sqlite]
         if p == "hithink":
             return [self._hithink_source, self._a_stock_data_source, self._indevs_source, self._bridge, self._sqlite]
         if p == "a-stock-data":
@@ -910,6 +997,11 @@ class CompositeDataSource:
         end_date: str | None = None,
     ) -> list[dict]:
         """获取 K 线数据，优先从 DB 读取，DB 没有时调 API 并缓存"""
+        if self._reads_local_tdx():
+            rows = self._tdx_source.get_kline_dicts(ts_code, days=days, start_date=start_date, end_date=end_date)
+            if rows:
+                return rows
+
         # 1. 先查 DB（与 SqliteDataSource 走同一条 SQL——此前这里是逐字副本）
         with get_connection() as conn:
             # sqlite3.Row 构造开销大，批量逐股调用场景下用裸元组 + zip 转 dict 更快
@@ -967,6 +1059,11 @@ class CompositeDataSource:
 
         返回 {ts_code: [K 线 dict 升序]}，无数据的股票对应空列表。
         """
+        if self._reads_local_tdx():
+            return {
+                code: self.get_kline_dicts(code, days=days, start_date=start_date, end_date=end_date)
+                for code in ts_codes
+            }
         result = self._sqlite.get_kline_dicts_batch(ts_codes, days=days, start_date=start_date, end_date=end_date)
         # DB 缺失的股票走单股回退路径（含 save_klines 缓存写回）
         for code in ts_codes:
@@ -1021,6 +1118,7 @@ def dict_to_daily(klines: list[dict] | list) -> list:
                     "is_fangliang_yinxian",
                     close < prev_close and vol > prev_vol * 1.5 if prev_vol > 0 else False,
                 ),
+                turnover_rate=row.get("turnover_rate"),
             )
         )
     return result
@@ -1080,4 +1178,6 @@ def get_datasource(preferred: str = "auto") -> DataSource:
         return AStockDataDataSource()
     if preferred == "hithink":
         return HithinkFinanceDataSource()
+    if preferred == "tdx":
+        return TdxLocalDataSource()
     return CompositeDataSource("auto")

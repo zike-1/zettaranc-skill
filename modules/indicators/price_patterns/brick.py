@@ -72,6 +72,49 @@ def calculate_brick_value(klines: list[DailyData]) -> float:
     return round(brick, 2)
 
 
+def calculate_brick_series(klines: list[DailyData]) -> list[float]:
+    """一次算出每根 K 线的砖值，结果和逐段调用 :func:`calculate_brick_value` 相同。
+
+    回测里每个持仓日都要数砖，逐段调用是平方复杂度。
+    """
+    n = len(klines)
+    if n < 12:
+        return [0.0] * n
+
+    var1a_list: list[float] = []
+    var3a_list: list[float] = []
+    for i in range(3, n):
+        hhv4 = max(k.high for k in klines[i - 3 : i + 1])
+        llv4 = min(k.low for k in klines[i - 3 : i + 1])
+        close = klines[i].close
+        if hhv4 == llv4:
+            var1a_list.append(-90.0)
+            var3a_list.append(50.0)
+        else:
+            var1a_list.append((hhv4 - close) / (hhv4 - llv4) * 100 - 90.0)
+            var3a_list.append((close - llv4) / (hhv4 - llv4) * 100)
+
+    var2a = calculate_sma_series(var1a_list, 4, 1)
+    var5a = calculate_sma_series(calculate_sma_series(var3a_list, 6, 1), 6, 1)
+
+    series = [0.0] * n
+    for i in range(11, n):
+        var6a = var5a[i - 3] - var2a[i - 3]
+        series[i] = round(var6a - 4, 2) if var6a > 4 else 0.0
+    return series
+
+
+def red_brick_streak(klines: list[DailyData]) -> int:
+    """当前连续红砖数；最新一块是绿砖时返回 0。红砖的判定同 :func:`detect_four_brick_system`。"""
+    series = calculate_brick_series(klines)[7:]
+    count = 0
+    for i in range(len(series) - 1, 0, -1):
+        if series[i] < series[i - 1]:
+            break
+        count += 1
+    return count
+
+
 def calculate_brick_history(klines: list[DailyData], lookback: int = 20) -> tuple[str, int]:
     """
     计算砖型图趋势（连续红砖/绿砖数量）
@@ -95,10 +138,8 @@ def calculate_brick_history(klines: list[DailyData], lookback: int = 20) -> tupl
     brick_colors: list[int] = []
     prev_brick = None
 
-    for i in range(8, len(klines) + 1):
-        sub_klines = klines[:i]
-        brick_val = calculate_brick_value(sub_klines)
-
+    # 从第 8 根开始的砖值；一次算出，和逐段调用 calculate_brick_value 结果相同
+    for brick_val in calculate_brick_series(klines)[7:]:
         if prev_brick is not None:
             if brick_val >= prev_brick:
                 brick_colors.append(1)  # 红砖 = 上涨
@@ -185,12 +226,10 @@ def detect_four_brick_system(klines: list[DailyData]) -> dict:
         result["brick_action_desc"] = "数据不足"
         return result
 
-    # 计算历史砖值序列（至少需要8天才能开始算砖值）
-    brick_history = []
-    for i in range(8, len(klines) + 1):
-        sub_klines = klines[:i]
-        brick_val = calculate_brick_value(sub_klines)
-        brick_history.append(brick_val)
+    # 计算历史砖值序列（至少需要8天才能开始算砖值）。一次算出，和逐段调用 calculate_brick_value
+    # 结果相同；逐段调用是平方复杂度，detect_brick_signals 每天再调一次就成了立方（2026-11-03
+    # 实测单只股票 analyze 15 秒，几乎全在这里）
+    brick_history = calculate_brick_series(klines)[7:]
 
     if len(brick_history) < 3:
         result["brick_action_desc"] = "数据不足"

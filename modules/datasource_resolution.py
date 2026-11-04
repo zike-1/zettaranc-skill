@@ -21,6 +21,7 @@
 ============================================  ==========================
 条件                                           选中的 provider
 ============================================  ==========================
+``TDX_DIR``（目录下有 vipdoc）                 tdx（本地通达信盘后数据）
 ``HITHINK_FINANCE_API_KEY``                   hithink（同花顺官方）
 ``INDEVS_API_KEY``                            indevs
 ``DATA_MODE=jnb`` 且 ``TUSHARE_TOKEN``        tushare
@@ -47,7 +48,7 @@ class ProviderResolution:
     """一次数据源决议的结果。
 
     Attributes:
-        provider: 选中的 provider 名（``'hithink'`` / ``'indevs'`` / ``'tushare'``）；
+        provider: 选中的 provider 名（``'tdx'`` / ``'hithink'`` / ``'indevs'`` / ``'tushare'``）；
             ``None`` 表示没有配置任何数据源，调用方应回退免费源（a-stock-data）。
         reason: 决议依据。写进日志与测试断言——"为什么选它"不该只能靠读代码。
     """
@@ -75,6 +76,10 @@ def resolve_provider() -> ProviderResolution:
     Returns:
         ProviderResolution(provider, reason)。
     """
+    from .tdx_local_client import configured_root
+
+    if configured_root() is not None:
+        return ProviderResolution("tdx", "配置了 TDX_DIR，读本地通达信盘后数据")
     if os.environ.get("HITHINK_FINANCE_API_KEY"):
         return ProviderResolution("hithink", "配置了 HITHINK_FINANCE_API_KEY")
     if os.environ.get("INDEVS_API_KEY"):

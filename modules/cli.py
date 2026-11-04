@@ -24,7 +24,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import sys
 
 from .core.net import disable_proxy
@@ -90,7 +92,9 @@ def build_parser() -> argparse.ArgumentParser:
     # ── screen ──
     p_screen = subparsers.add_parser("screen", help="批量选股（11 种策略）")
     p_screen.add_argument("--strategy", choices=STRATEGY_CHOICES, default="B1", help="筛选策略（11 种别名）")
-    p_screen.add_argument("--limit", type=int, default=20, help="输出数量（0=全市场，约 5200 只）")
+    p_screen.add_argument("--limit", type=int, default=20, help="返回条数（0=全部命中，默认 20）")
+    p_screen.add_argument("--pool", type=int, default=0, help="扫描数量（默认 0=全市场）")
+    p_screen.add_argument("--include-st", action="store_true", help="保留 ST 股票（默认按当前简称剔除）")
     p_screen.add_argument("--no-parallel", action="store_true", help="禁用多进程并行")
     p_screen.add_argument("--json", action="store_true", help="JSON输出")
     p_screen.add_argument(
@@ -99,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="覆盖策略参数（可重复），如 --param j_threshold=20",
     )
-    p_screen.add_argument("--top", type=int, default=0, help="返回条数上限（0=全部命中，默认 0）")
+    p_screen.add_argument("--top", type=int, default=0, help="--limit 的别名，优先级更高")
 
     # ── score ──
     p_score = subparsers.add_parser("score", help="单只股票综合评分")
@@ -107,7 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--json", action="store_true", help="JSON输出")
 
     # ── workflow ──
-    subparsers.add_parser("workflow", help="每日五步工作流")
+    p_workflow = subparsers.add_parser("workflow", help="每日五步工作流")
+    p_workflow.add_argument("--json", action="store_true", help="JSON输出（与 daily 同一份数据）")
 
     # ── diagnose ──
     p_diag = subparsers.add_parser("diagnose", help="持仓诊断")
@@ -139,7 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_run.add_argument(
         "--skip-indicators", action="store_true", help="跳过指标缓存（单只默认同步，批量需 --indicators）"
     )
-    p_sync_sub.add_parser("status", help="查看同步状态")
+    p_sync_status = p_sync_sub.add_parser("status", help="查看同步状态")
+    p_sync_status.add_argument("--json", action="store_true", help="JSON输出")
     p_sync_factor = p_sync_sub.add_parser("stk-factor", help="同步 Tushare 官方指标（diff 验证用）")
     p_sync_factor.add_argument("ts_code", nargs="?", help="股票代码（不传 = 全市场）")
     p_sync_factor.add_argument("--days", type=int, default=365, help="同步天数")
@@ -177,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt_shaofu = p_bt_sub.add_parser("shaofu", help="少妇战法六步回测")
     p_bt_shaofu.add_argument("ts_code", help="股票代码")
     p_bt_shaofu.add_argument("--days", type=int, default=250, help="回测天数")
+    p_bt_shaofu.add_argument("--no-timing", action="store_true", help="不按活跃市值择时")
     p_bt_shaofu.add_argument("--json", action="store_true", help="JSON输出")
 
     p_bt_multi = p_bt_sub.add_parser("multi", help="多策略融合回测")
@@ -232,9 +239,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_daily = subparsers.add_parser("daily", help="每日五步工作流")
     p_daily.add_argument("--json", action="store_true", help="JSON输出")
 
+    # ── report ──
+    p_report = subparsers.add_parser("report", help="每日选股报告（HTML：活跃市值、持仓、今日选股、红利组B1、入选后表现）")
+    p_report.add_argument("--out", default="", help="报告目录（默认 .env 的 REPORT_OUT_DIR，再不行用当前目录下的 reports）：YYYY-MM-DD.html、data/YYYY-MM-DD.json、index.html")
+    p_report.add_argument("--blocks", default="", help="要跑的选股名，逗号分隔（默认 .env 的 ZT_REPORT_BLOCKS）")
+    p_report.add_argument("--no-dividend", action="store_true", help="不扫红利组（电力/银行/保险）")
+    p_report.add_argument("--no-quotes", action="store_true", help="本地缺当天 K 线时不用实时行情补")
+    p_report.add_argument("--no-sync", action="store_true", help="不同步到工作台「今日选股」分组")
+    p_report.add_argument("--refresh-amv", action="store_true", help="先打开指南针更新活跃市值，更新完正常退出")
+
+    # ── tq-formulas / tq-select：用通达信自己的公式引擎（需要通达信开着）──
+    subparsers.add_parser("tq-formulas", help="列出通达信里的自定义条件选股公式（JSON）")
+    p_tqs = subparsers.add_parser("tq-select", help="用通达信引擎跑一个选股公式（JSON）")
+    p_tqs.add_argument("--formula", required=True, help="通达信里的公式名，如 我的B1选股")
+    p_tqs.add_argument("--date", default="", help="交易日 YYYYMMDD；默认用通达信最新一根（盘中即当天实时）")
+    p_tqs.add_argument("--boards", default="主板", help="板块，逗号分隔；all 表示不过滤")
+
+    # ── amv-refresh ──
+    p_amv = subparsers.add_parser("amv-refresh", help="打开指南针更新活跃市值（0AMV），更新完正常退出")
+    p_amv.add_argument("--wait", type=int, default=180, help="最多等几秒")
+
     # ── market ──
     p_market = subparsers.add_parser("market", help="市场择时指标")
     p_market_sub = p_market.add_subparsers(dest="market_sub", required=True)
+    p_market_amv = p_market_sub.add_parser("amv", help="活跃市值多空状态（SOP 第一步择时）")
+    p_market_amv.add_argument("--json", action="store_true", help="JSON输出")
     p_market_timing = p_market_sub.add_parser("timing", help="计算市场择时指标")
     p_market_timing.add_argument("--date", default=None, help="交易日 YYYYMMDD，默认最新")
     p_market_timing.add_argument("--index", default="000001.SH", help="大盘指数代码")
@@ -345,6 +374,100 @@ def _argparse_error_message(parser: argparse.ArgumentParser, argv: list[str]) ->
     return "命令行参数错误"
 
 
+def cmd_report(args) -> None:
+    """生成每日选股报告，写到 ``<out>/YYYY-MM-DD.html``，并把路径打印出来。"""
+    from pathlib import Path
+
+    from .daily_selection_report import write_report
+
+    blocks = tuple(name.strip() for name in args.blocks.split(",") if name.strip()) or None
+    amv_refresh = None
+    if args.refresh_amv:
+        from dataclasses import asdict
+        from datetime import date
+
+        from .zhinanzhen_refresh import refresh_amv
+
+        result = refresh_amv(f"{date.today():%Y-%m-%d}")
+        amv_refresh = {**asdict(result), "updated": result.updated}
+        print(f"活跃市值 {result.before} → {result.after}" + (f"（{result.error}）" if result.error else ""))
+    out_dir = Path(args.out or os.environ.get("REPORT_OUT_DIR", "").strip() or "reports")
+    path = write_report(
+        out_dir,
+        amv_refresh=amv_refresh,
+        sync_dsh=not args.no_sync,
+        blocks=blocks,
+        include_dividend=not args.no_dividend,
+        use_quotes=not args.no_quotes,
+    )
+    print(path)
+
+
+def _print_json(payload) -> None:
+    import json
+
+    sys.stdout.reconfigure(encoding="utf-8")
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def cmd_tq_formulas(args) -> None:
+    """列出通达信自定义选股公式。失败时输出 {ok:false,error}，退出码 0（调用方按 ok 判断）。"""
+    from . import tdx_tq
+
+    try:
+        _print_json({"ok": True, "formulas": tdx_tq.list_formulas()})
+    except tdx_tq.TqUnavailable as e:
+        _print_json({"ok": False, "error": str(e)})
+    finally:
+        tdx_tq.close()
+
+
+def cmd_tq_select(args) -> None:
+    """用通达信引擎选股，输出 {ok, formula, trade_date, picks:[{code,name}], ...}。"""
+    from . import tdx_tq
+    from .tdx_local_client import local_stock_name
+
+    try:
+        sel = tdx_tq.select(args.formula, args.date or None)
+        trade_date = sel.trade_date
+        boards = None if args.boards.strip().lower() == "all" else tuple(b for b in args.boards.split(",") if b)
+        picks = tdx_tq.filter_universe(sel.picks, boards)
+        _print_json({
+            "ok": True, "engine": "通达信", "formula": args.formula, "trade_date": trade_date,
+            "boards": list(boards) if boards else "all", "scanned": sel.scanned, "total_hits": len(sel.picks),
+            "skipped_short": sel.skipped_short,
+            "picks": [{"code": c, "name": local_stock_name(c) or ""} for c in picks],
+        })
+    except tdx_tq.TqUnavailable as e:
+        _print_json({"ok": False, "error": str(e)})
+    finally:
+        tdx_tq.close()
+
+
+def cmd_amv_refresh(args) -> None:
+    """打开指南针更新活跃市值，打印更新前后的日期。"""
+    from datetime import date
+
+    from .zhinanzhen_refresh import refresh_amv
+
+    result = refresh_amv(f"{date.today():%Y-%m-%d}", wait_seconds=args.wait)
+    print(f"活跃市值 {result.before} → {result.after}；本次打开={result.started_by_us} 已退出={result.closed} 等待={result.waited_seconds}s")
+    if result.error:
+        print(result.error)
+
+
+def _ensure_database() -> None:
+    """首次运行时自动建表，避免 README 的第一条命令就报 no such table。"""
+    from .database import get_connection, init_database
+
+    with get_connection() as conn:
+        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'daily_kline'").fetchone()
+    if not exists:
+        # init_database 会打印提示，不能混进 --json 的 stdout
+        with contextlib.redirect_stdout(sys.stderr):
+            init_database()
+
+
 def main() -> None:
     """zt CLI 主入口"""
     parser = build_parser()
@@ -384,6 +507,10 @@ def main() -> None:
         "backtest": cmd_backtest,
         "trade": cmd_trade,
         "daily": cmd_daily,
+        "report": cmd_report,
+        "amv-refresh": cmd_amv_refresh,
+        "tq-formulas": cmd_tq_formulas,
+        "tq-select": cmd_tq_select,
         "market": cmd_market_timing,
         "track": cmd_track,
         "self-optimize": cmd_self_optimize,
@@ -394,7 +521,14 @@ def main() -> None:
 
     from .core.errors import ZettarancError
 
+    # JSON 是给程序读的，固定 UTF-8；否则 Windows 默认 GBK，宿主按 UTF-8 解析会失败
+    if getattr(args, "json", False):
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
     try:
+        _ensure_database()
         # handler 的返回值是进程退出码。多数 handler 返回 None（等价 0），
         # 但 cmd_verify_v10 / cmd_self_optimize 会返回非 0——以前这里丢弃返回值，
         # 参数错误或未知 action 时进程仍退 0，宿主脚本会误判成功。

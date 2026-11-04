@@ -130,10 +130,16 @@ def _child_wait_n_times(n: int, max_per_min: int) -> int:
     return rl.current_count
 
 
+def _mp_context():
+    """有 fork 用 fork（Linux/macOS），Windows 只有 spawn"""
+    method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    return multiprocessing.get_context(method)
+
+
 def test_rate_limiter_works_in_subprocess():
     """_RateLimiter 必须在子进程中能正常工作（multiprocessing.Lock 可继承）"""
     # 子进程中调 3 次 wait()，current_count 应为 3
-    ctx = multiprocessing.get_context("fork")
+    ctx = _mp_context()
     with ctx.Pool(1) as pool:
         result = pool.apply_async(_child_wait_n_times, (3, 1000))
         count = result.get(timeout=10)
@@ -142,7 +148,7 @@ def test_rate_limiter_works_in_subprocess():
 
 def test_rate_limiter_works_across_multiple_subprocesses():
     """多子进程并发调 wait() 必须全部成功（multiprocessing.Lock 序列化）"""
-    ctx = multiprocessing.get_context("fork")
+    ctx = _mp_context()
     with ctx.Pool(2) as pool:
         r1 = pool.apply_async(_child_wait_n_times, (5, 1000))
         r2 = pool.apply_async(_child_wait_n_times, (5, 1000))

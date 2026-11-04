@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 from .core.errors import ErrorCode
 from .datasource import daily_to_dict
+from .tdx_local_client import local_stock_name
 from .indicators import (
     analyze_stock,
     get_kline_data,
@@ -109,8 +110,10 @@ def diagnose_stock(ts_code: str, days: int = 100) -> DiagnosisReport:
         DiagnosisReport 诊断报告
     """
     # 获取股票名称
-    stock_info = get_stock_info_db(ts_code)
-    name = stock_info.get("name", ts_code) if stock_info else ts_code
+    name = local_stock_name(ts_code)
+    if name is None:
+        stock_info = get_stock_info_db(ts_code)
+        name = stock_info.get("name", ts_code) if stock_info else ts_code
 
     # 指标分析
     indicators = analyze_stock(ts_code, days=days)

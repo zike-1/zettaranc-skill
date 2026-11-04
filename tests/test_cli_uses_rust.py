@@ -144,6 +144,22 @@ def _isolate_rust_test_state():
         _rust_compat.reset_func_cache()
 
 
+@pytest.fixture(autouse=True)
+def _rust_env_and_klines(monkeypatch):
+    """本文件测的是 Rust 接线：默认实现改成 Python 后，这里显式选 Rust。
+
+    cmd_backtest 现在会先取 K 线（没数据要明确报错），用一根假 K 线绕过数据库。
+    """
+    import modules.indicators as indicators
+
+    monkeypatch.setenv("ZETTARANC_BACKTEST_IMPL", "rust")
+    monkeypatch.setattr(
+        indicators,
+        "get_kline_data",
+        lambda ts_code, days, **_: [SimpleNamespace(trade_date="20240102", open=10.0, high=10.5, low=9.5, close=10.2, vol=1000.0, amount=10000.0, pct_chg=0.0)],
+    )
+
+
 @pytest.fixture
 def fake_rust_module():
     """注入一个 fake _core_compute 到 sys.modules 并清缓存。
@@ -616,7 +632,7 @@ def test_cmd_backtest_shaofu_uses_rust_when_available(fake_rust_module, capsys):
     ]
 
     shaofu.backtest_shaofu_single = tracker
-    indicators.get_kline_data = lambda ts_code, days: fake_klines
+    indicators.get_kline_data = lambda ts_code, days, **_: fake_klines
     try:
         args = SimpleNamespace(
             backtest_sub="shaofu",
@@ -782,7 +798,7 @@ def test_verify_pipeline_uses_rust_when_available(fake_rust_module):
         )
     ]
     original_gk = getattr(indicators, "get_kline_data", None)
-    indicators.get_kline_data = lambda ts_code, days: fake_klines
+    indicators.get_kline_data = lambda ts_code, days, **_: fake_klines
     try:
         # 也需要 mock backtest_shaofu_single（作为 fallback 兜底）
         original_bs = verify_pipeline.backtest_shaofu_single

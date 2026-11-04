@@ -67,6 +67,7 @@ class DailyData:
     bbi: float | None = None
     macd_dif: float | None = None
     macd_dea: float | None = None
+    turnover_rate: float | None = None  # 当日换手率%（成交量 / 当时流通股本），数据源没有时为 None
     macd_hist: float | None = None
 
     def __getitem__(self, key: str) -> Any:
@@ -232,8 +233,9 @@ class IndicatorResult:
 
     # 两个30%原则 (B1筛选)
     b1_rally_pct: float = 0  # B1建仓波涨幅%
-    b1_turnover: float = 0  # B1累计换手率%
-    b1_pass_30: bool = False  # 是否通过两个30%原则
+    b1_turnover: float | None = None  # 近30天最大三根阳量的累计换手率%，没有换手数据时为 None
+    b1_pass_30: bool = False  # 是否通过两个30%原则（涨幅和换手都不超过30%）
+    b1_30_status: str = "数据不足"  # 通过 / 偏高 / 废B1 / 换手未知 / 数据不足
 
     # 娜娜图 (完美建仓形态)
     is_nana: bool = False  # 娜娜图信号

@@ -30,6 +30,7 @@ from ..datasource import (
     DataSource,
     HithinkFinanceDataSource,
     IndevsDataSource,
+    TdxLocalDataSource,
     TushareDataSource,
 )
 from ..datasource_resolution import ProviderResolution, resolve_provider
@@ -57,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 def _build_resolved_source(resolution: ProviderResolution, token: str | None) -> DataSource:
     """按决议结果构造默认数据源；构造失败时回退免费源。"""
+    if resolution.provider == "tdx":
+        return TdxLocalDataSource()
     if resolution.provider == "hithink":
         return HithinkFinanceDataSource()
     if resolution.provider == "indevs":

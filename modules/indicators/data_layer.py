@@ -1,8 +1,10 @@
 from typing import Any, Optional
 from collections.abc import Callable
+from contextlib import closing
 import logging
 
 from ..core.kline import read_kline_rows
+from ..tdx_local_client import local_kline_rows
 
 """
 技术指标数据层模块
@@ -257,14 +259,13 @@ def _load_indicator_cache(ts_code: str, trade_date: str) -> IndicatorResult | No
         return _indicator_memory_cache[mem_key]
 
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM indicator_cache WHERE ts_code = ? AND trade_date = ?",
-            (ts_code, trade_date),
-        )
-        row = cursor.fetchone()
-        conn.close()
+        with closing(get_db_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM indicator_cache WHERE ts_code = ? AND trade_date = ?",
+                (ts_code, trade_date),
+            )
+            row = cursor.fetchone()
 
         if not row:
             return None
@@ -285,11 +286,10 @@ def _save_indicator_cache(result: IndicatorResult, klines: list[DailyData]) -> b
 
     today = klines[-1]
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(_SAVE_SQL, _build_save_tuple(result, today))
-        conn.commit()
-        conn.close()
+        with closing(get_db_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(_SAVE_SQL, _build_save_tuple(result, today))
+            conn.commit()
         _indicator_memory_cache[(result.ts_code, result.trade_date)] = result
         return True
     except (OSError, KeyError, ValueError, AttributeError, TypeError) as e:
@@ -303,22 +303,27 @@ def clear_indicator_memory_cache() -> None:
     _indicator_memory_cache.clear()
 
 
-def get_kline_data(ts_code: str, days: int = 100) -> list[DailyData]:
+def get_kline_data(ts_code: str, days: int = 100, basis: str = "display") -> list[DailyData]:
     """
     获取K线数据
+
+    配置 ``TDX_DIR`` 时读本地通达信（前复权现算），否则读本地 SQLite。
 
     Args:
         ts_code: 股票代码
         days: 获取天数
+        basis: 价格口径，``display`` 为看盘口径，``return`` 为算收益用的等比口径。
+            只对通达信本地数据生效。
 
     Returns:
         K线数据列表（按日期升序）
     """
-    conn = get_db_connection()
-    # K 线读取 SQL 的唯一来源：modules.core.kline（此前这里与 datasource 的两处
-    # 各自抄了一份同样语义的查询）
-    rows = read_kline_rows(ts_code, conn=conn, limit=days)
-    conn.close()
+    rows = local_kline_rows(ts_code, days=days, basis=basis)
+    if rows is None:
+        # K 线读取 SQL 的唯一来源：modules.core.kline（此前这里与 datasource 的两处
+        # 各自抄了一份同样语义的查询）
+        with closing(get_db_connection()) as conn:
+            rows = read_kline_rows(ts_code, conn=conn, limit=days)
 
     data_list = []
     for i, row in enumerate(rows):
@@ -335,6 +340,7 @@ def get_kline_data(ts_code: str, days: int = 100) -> list[DailyData]:
                 amount=row["amount"],
                 pct_chg=row["pct_chg"],
                 prev_close=prev_close,
+                turnover_rate=row.get("turnover_rate"),
             )
         )
 
@@ -504,7 +510,9 @@ def _step_violence_k(klines, result):
 def _step_two_30(klines, result):
     rule30 = check_two_30_rule(klines)
     result.b1_rally_pct = rule30["b1_rally_pct"]
+    result.b1_turnover = rule30["b1_turnover"]
     result.b1_pass_30 = rule30["b1_pass_30"]
+    result.b1_30_status = rule30["b1_30_status"]
 
 
 def _step_nana(klines, result):
@@ -832,7 +840,8 @@ def format_result(result: IndicatorResult) -> str:
 
     # 两个30%原则
     if result.b1_rally_pct != 0 or result.b1_pass_30:
-        lines.append(f"[两个30%原则] B1涨幅={result.b1_rally_pct:.1f}%  通过:{result.b1_pass_30}")
+        turnover = "未知" if result.b1_turnover is None else f"{result.b1_turnover:.1f}%"
+        lines.append(f"[两个30%原则] 建仓波涨幅={result.b1_rally_pct:.1f}%  累计换手={turnover}  判定:{result.b1_30_status}")
         lines.append("")
 
     # 娜娜图/黄金碗/呼吸结构/SB1/B3

@@ -102,6 +102,9 @@ def cmd_sync(args) -> None:
         # 状态只读数据库，与数据源无关
         syncer = DataSyncer()
         status = syncer.get_sync_status()
+        if getattr(args, "json", False):
+            json_output(status)
+            return
         print("=" * 50)
         print(f"  数据库: {status.get('db_path', 'N/A')}")
         print(f"  股票: {status.get('stock_count', 0)}")
@@ -259,8 +262,33 @@ def cmd_monitor(args) -> None:
         print(f"详细警报分析已输出至 {REPORTS_DIR}/monitor_alert.md")
 
 
+def _cmd_market_amv(args) -> None:
+    """活跃市值多空状态。"""
+    from dataclasses import asdict
+
+    from modules.active_market_value import current_market_state, next_day_triggers
+
+    state = current_market_state()
+    if state is None:
+        error("没有活跃市值数据：请配置 ZHINANZHEN_DATA_DIR", as_json=bool(getattr(args, "json", False)))
+    triggers = next_day_triggers(state)
+    if getattr(args, "json", False):
+        json_output({**asdict(state), "can_open": state.state == "BULL", **triggers})
+        return
+    label = {"BULL": "多头", "BEAR": "空头", "UNKNOWN": "未确认"}[state.state]
+    print(f"活跃市值 {state.date}：{label}（自 {state.since} 起），当日 {state.pct_chg:+.2f}%，两日合计 {state.two_day_sum:+.2f}%")
+    if triggers["next_day_bull_at"] is not None:
+        print(f"下一交易日单日 ≥{triggers['next_day_bull_at']:+.2f}% 转多")
+    if triggers["next_day_bear_at"] is not None:
+        print(f"下一交易日单日 ≤{triggers['next_day_bear_at']:+.2f}% 转空")
+
+
 def cmd_market_timing(args) -> None:
     """市场择时指标命令。"""
+    if getattr(args, "market_sub", "timing") == "amv":
+        _cmd_market_amv(args)
+        return
+
     from modules.market_timing import compute_market_timing, format_market_timing
 
     result = compute_market_timing(

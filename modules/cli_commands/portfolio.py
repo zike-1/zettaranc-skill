@@ -34,6 +34,9 @@ def cmd_watchlist(args) -> None:
 
     elif action == "list":
         stocks = list_watch()
+        if getattr(args, "json", False):
+            json_output({"count": len(stocks), "stocks": stocks})
+            return
         print(f"\n自选股列表 ({len(stocks)}只):")
         for s in stocks:
             tags = s.get("tags", "") or "无"
@@ -103,8 +106,8 @@ def cmd_trade(args) -> None:
         if not text:
             error('请输入交易描述，如: trade add "4月25号买了100股茅台，1800块"', as_json=use_json)
 
-        from .trade_parser import TradeParser
-        from .trade_manager import TradeManager
+        from ..trade_parser import TradeParser
+        from ..trade_manager import TradeManager
 
         parser = TradeParser()
         result = parser.parse(text)
@@ -153,7 +156,7 @@ def cmd_trade(args) -> None:
 
     # ── list: 列出交易记录 ──
     elif sub == "list":
-        from .trade_manager import TradeManager
+        from ..trade_manager import TradeManager
 
         manager = TradeManager()
         limit = getattr(args, "limit", 20)
@@ -178,8 +181,8 @@ def cmd_trade(args) -> None:
 
     # ── review: 构建复盘上下文 ──
     elif sub == "review":
-        from .trade_manager import TradeManager
-        from .trade_reviewer import TradeReviewer
+        from ..trade_manager import TradeManager
+        from ..trade_reviewer import TradeReviewer
 
         manager = TradeManager()
         reviewer = TradeReviewer()
@@ -187,6 +190,8 @@ def cmd_trade(args) -> None:
         # 获取最近一笔交易
         trades = manager.get_recent_trades(limit=1)
         if not trades:
+            if use_json:
+                json_output({"count": 0, "message": "暂无交易记录，请先添加交易"})
             warn("暂无交易记录，请先添加交易")
             return
 
@@ -226,7 +231,7 @@ def cmd_trade(args) -> None:
 
     # ── stats: 交易统计 ──
     elif sub == "stats":
-        from .trade_manager import TradeManager
+        from ..trade_manager import TradeManager
 
         manager = TradeManager()
         summary = manager.get_summary()
@@ -287,7 +292,7 @@ def _daily_step_watchlist(report: dict) -> list:
     from modules.core.errors import ErrorCode
 
     try:
-        from .watchlist import scan_watchlist, list_watch
+        from ..watchlist import scan_watchlist, list_watch
 
         watches = list_watch()
         if not watches:
@@ -346,7 +351,7 @@ def _daily_step_screener(report: dict) -> None:
     from modules.core.errors import ErrorCode
 
     try:
-        from .screener import screen_stocks
+        from ..screener import screen_stocks
 
         top_picks_raw = screen_stocks(criteria="b1", max_stocks=20)
         top_picks = []
@@ -386,7 +391,7 @@ def _daily_step_portfolio(report: dict, watches: list) -> None:
     from modules.core.errors import ErrorCode
 
     try:
-        from .portfolio_diagnosis import diagnose_stock
+        from ..portfolio_diagnosis import diagnose_stock
 
         check_codes: list[str] = []
         wl = report["watchlist_scan"]

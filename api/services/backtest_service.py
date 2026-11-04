@@ -89,6 +89,7 @@ def _shaofu_to_response(ts_code: str, result) -> dict:
             "max_drawdown": d["max_drawdown"],
             "sharpe_ratio": d["sharpe_ratio"],
             "avg_holding_days": d["avg_holding_days"],
+            "in_market_ratio": d["in_market_ratio"],
             # 少妇战法路径的资金曲线是【交易序】而非日序，无法按日频年化——
             # 该指标不可得，0 表示"不可得"而非"年化 0%"。
             "annualized_return": 0,

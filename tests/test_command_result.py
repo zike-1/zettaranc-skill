@@ -18,6 +18,7 @@ import sys
 
 import pytest
 
+from conftest import utf8_child_env
 from modules.core.command_result import CommandResult, exception_to_dict, http_status_for
 from modules.core.errors import ErrorCode, ZettarancError
 
@@ -27,7 +28,8 @@ def _run_cli(*args: str) -> tuple[int, str, str]:
     proc = subprocess.run(
         [sys.executable, "-m", "modules.cli", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        env=utf8_child_env(),
         timeout=120,
         cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1]),
     )

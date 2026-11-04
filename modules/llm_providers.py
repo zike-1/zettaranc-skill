@@ -30,8 +30,9 @@ class MiniMaxProvider:
     DEFAULT_MODEL = "MiniMax-M3"
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None, model: str | None = None) -> None:
-        # 支持 LLM_API_KEY 或 ANTHROPIC_API_KEY
-        self.api_key = api_key or os.getenv("LLM_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
+        # 只用 LLM_API_KEY。不能回退到 ANTHROPIC_API_KEY：默认地址是 MiniMax，
+        # 回退会把用户的 Anthropic 密钥发给第三方。
+        self.api_key = api_key or os.getenv("LLM_API_KEY", "")
         self.base_url: str = base_url or os.getenv("LLM_BASE_URL") or self.DEFAULT_BASE_URL
         self.model = model or os.getenv("LLM_MODEL", self.DEFAULT_MODEL)
 

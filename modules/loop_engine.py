@@ -2,19 +2,25 @@
 """
 少妇战法六步闭环引擎
 
-状态机驱动的交易循环，严格遵循 Z 哥 SOP 六步流程：
-  1. 择时 → 2. 选股 → 3. 等B1 → 4. 设止损 → 5. 卤煮止盈 → 6. 白线两日破位离场
+六步 SOP：择时 → 选股 → 等 B1 → 设止损 → 卤煮减半 → 连续两日收盘跌破 BBI 清仓。
+规则和出处见 :mod:`modules.strategies.shaofu_rules`，这里只负责按规则走流程。
+
+时序（日线数据，不用未来信息）：
+  - T 日收盘判断信号或离场条件，T+1 日开盘成交
+  - 买入 K 线（T+1）收盘后才确定止损价，从这根收盘开始检查离场
+  - 开盘涨停不追，开盘跌停卖不出就顺延
+
+离场按七层应对的优先级检查：没涨就走 → 盈转亏必走 → 止损 → S1 与嘀嘀 → 破位与破黄线 → 死叉。
+第 4 层放飞是减仓，不离场：卤煮减半和第四块红砖各减一次。
 
 核心趋势线：
-  - 白线（Z哥白线）= EMA(EMA(C,10),10) — 短期趋势支撑，"牵牛绳"
-  - 黄线（大哥线）= (MA14+MA28+MA57+MA114)/4 — 中期趋势
-  - 白线在黄线上 = 主力牵牛，任何下跌都是洗盘
-  - 白线死叉黄线 = 无条件清仓
+  - 白线（Z哥白线）= EMA(EMA(C,10),10)
+  - 黄线（大哥线）= (MA14+MA28+MA57+MA114)/4
+  - BBI = (MA3+MA6+MA12+MA24)/4
 
 用法：
     from modules.loop_engine import ShaofuLoopEngine, LoopConfig
-    engine = ShaofuLoopEngine(LoopConfig(j_threshold=12))
-    trades = engine.run_stock(klines)
+    trades = ShaofuLoopEngine().run_stock(klines)
 """
 
 from __future__ import annotations
@@ -23,7 +29,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, cast
 
+from .strategies.sell_signals import detect_s1
 from .strategies.shaofu_b1 import detect_shaofu_b1
+from .strategies.shaofu_rules import rule_value
 from .strategies.resonance import (
     DETECTOR_REGISTRY,
     SignalDetector,
@@ -43,6 +51,8 @@ from .indicators import (
     detect_double_line_cross,
     detect_trade_signal,
 )
+from .indicators.price_patterns.brick import red_brick_streak
+from .indicators.price_patterns.screener_helper import detect_didi
 from .constants import BACKTEST_DEFAULT_TRAILING_STOP_PCT
 
 
@@ -70,21 +80,39 @@ class LoopState(Enum):
 class LoopConfig:
     """策略参数配置"""
 
-    j_threshold: float = 12  # B1 J 值阈值（SOP: J<=12，最好负值）
-    stop_loss_pct: float = -0.03  # 止损比例（现已实际生效，原硬编码 0.97 = -3%）
-    stop_loss_method: str = "entry_low"  # "entry_low" | "n_structure_low" | "j_negative_low" | "atr_based"
+    # 默认值都来自 strategies/shaofu_rules.py，出处写在那里
+    j_threshold: float = rule_value("j_threshold")  # B1 J 值阈值
+    stop_loss_pct: float = rule_value("stop_loss_pct")  # 买入 K 线最低价向下的比例
+    stop_loss_method: str = rule_value("stop_loss_method")  # "entry_low" | "n_structure_low" | "j_negative_low" | "atr_based"
     # v3.10.1 新增：ATR 动态止损
     atr_stop_window: int = 14  # ATR 计算窗口
     atr_stop_multiplier: float = 2.0  # ATR 乘数（止损距离 = ATR × 倍数）
     # v3.10.1 新增：移动止损（trailing stop）
     trailing_stop_enabled: bool = False  # 是否启用移动止损
     trailing_stop_pct: float = BACKTEST_DEFAULT_TRAILING_STOP_PCT  # 移动止损比例（高点回落超过此比例则止损）
-    bbi_break_days: int = 2  # BBI 连续跌破天数触发离场
-    bbi_break_threshold: float = 0.01  # 收盘价低于 BBI 超过此比例才算"跌破"（1%）
-    min_holding_days: int = 3  # 最少持仓天数（避免入场后次日就被震出）
-    lu_half: bool = True  # 卤煮减半（站上BBI+连续两根阳线→减半）
-    position_pct: float = 0.3  # 单笔仓位比例
-    vol_shrink_threshold: float = 0.8  # 缩量判定阈值（当日量 / 前日量 < 此值视为缩量）
+    exit_line: str = rule_value("exit_line")  # 破位离场线："bbi"（1.0）| "white"（双线 Pro）
+    bbi_break_days: int = rule_value("bbi_break_days")  # 连续跌破离场线的天数
+    bbi_break_threshold: float = rule_value("bbi_break_threshold")  # 收盘低于离场线超过此比例才算跌破
+    break_requires_reclaim: bool = rule_value("break_requires_reclaim")  # 入场后站上过离场线，破位才生效
+    min_holding_days: int = rule_value("min_holding_days")  # 持有满此天数才检查离场
+    no_rise_days: int = rule_value("no_rise_days")  # 没涨就走：观察天数，0 表示关闭
+    no_rise_grace_days: int = rule_value("no_rise_grace_days")  # 没涨就走：额外宽限天数
+    profit_to_loss_exit: bool = rule_value("profit_to_loss_exit")  # 盈转亏必走
+    dead_cross_exit: bool = rule_value("dead_cross_exit")  # 白线死叉黄线清仓
+    lu_half: bool = rule_value("lu_half")  # 卤煮减半
+    big_yang_pct: float = rule_value("big_yang_pct")  # 中大阳线的最低涨幅（%）
+    fourth_brick_half: bool = rule_value("fourth_brick_half")  # 第四块红砖减半
+    s1_exit: bool = rule_value("s1_exit")  # S1 清仓
+    didi_exit: bool = rule_value("didi_exit")  # 嘀嘀清仓
+    yellow_break_exit: bool = rule_value("yellow_break_exit")  # 破黄线清仓
+    yellow_break_days: int = rule_value("yellow_break_days")  # 连续收在黄线下的天数
+    position_pct: float = rule_value("position_pct")  # 单笔仓位比例
+    vol_shrink_threshold: float = rule_value("vol_shrink_threshold")  # 缩量判定阈值（当日量 / 前日量 < 此值）
+    # 成本（回测用，全部置 0 可得到不含成本的结果）
+    commission_rate: float = rule_value("commission_rate")
+    stamp_duty_rate: float = rule_value("stamp_duty_rate")
+    transfer_fee_rate: float = rule_value("transfer_fee_rate")
+    slippage_pct: float = rule_value("slippage_pct")
 
     # v3.10.x: 多策略共振开关（默认全部关闭，保持原 B1 单策略行为）
     enable_b2: bool = False  # B2（B1 后放量长阳确认）
@@ -144,13 +172,19 @@ class LoopTrade:
     signal_strength: float = 0.0  # 信号总强度（多策略共振时使用）
     exit_date: str = ""
     exit_price: float = 0
-    exit_reason: str = ""  # "卤煮止盈" | "白线跌破" | "止损" | "白线死叉黄线"
+    exit_reason: str = ""  # "没涨就走" | "盈转亏" | "止损" | "S1" | "嘀嘀" | "BBI跌破" | "白线跌破" | "破黄线" | "白线死叉黄线"
     pnl_pct: float = 0
     holding_days: int = 0
     max_favorable: float = 0  # 最大浮盈%
     max_adverse: float = 0  # 最大浮亏%
     partial_exits: list[dict[str, Any]] = field(default_factory=list)  # 卤煮减仓记录
     position_pct: float = 0.0  # 该笔交易的实际仓位比例（占总资金）
+    entry_index: int = -1  # 买入 K 线在序列中的下标
+    max_close: float = 0.0  # 入场后最高收盘价（判断没涨就走、盈转亏）
+    line_reclaimed: bool = False  # 入场后收盘是否站上过离场线
+    yellow_reclaimed: bool = False  # 入场后收盘是否站上过黄线（含买入当天）
+    remaining_fraction: float = 1.0  # 还没卖出的比例
+    pending_exit_reason: str = ""  # 已触发离场但开盘跌停卖不出，顺延到下一日
     market_regime: str = ""  # 入场时的市场状态（BULL/BEAR/SIDEWAYS）
     strategy_source: str = ""  # v3.10.0：触发该交易的策略名（B1/B2/SB1/长安 等）
 
@@ -304,6 +338,10 @@ class ShaofuLoopEngine:
     - 支持回测场景（顺序遍历历史数据）
     """
 
+    # 指标只需要有限的历史：黄线要 114 根，再留足 EMA 和 KDJ 的收敛长度。
+    # 不截断的话每天都从头重算，长序列回测是平方复杂度。
+    _INDICATOR_WINDOW = 320
+
     def __init__(self, config: LoopConfig | None = None) -> None:
         """
         初始化引擎
@@ -312,6 +350,10 @@ class ShaofuLoopEngine:
             config: 策略参数配置，None 则使用默认值
         """
         self.config = config or LoopConfig()
+
+    def _prefix(self, klines: list[DailyData], day_idx: int) -> list[DailyData]:
+        """截至 day_idx 的 K 线（含），只保留计算指标需要的长度。"""
+        return klines[max(0, day_idx + 1 - self._INDICATOR_WINDOW) : day_idx + 1]
 
     # ----------------------------------------------------------
     # 公开检查方法（供外部测试和调用）
@@ -396,55 +438,55 @@ class ShaofuLoopEngine:
         """
         return current.close < entry_low
 
-    def check_lu_zhu(self, recent_klines: list[DailyData], white_line: float) -> bool:
+    def check_lu_zhu(
+        self,
+        recent_klines: list[DailyData],
+        line_value: float,
+        prev_line_value: float | None = None,
+    ) -> bool:
         """
-        Step 5: 检查卤煮止盈条件（公开接口）
+        Step 5: 检查卤煮减半条件（公开接口）
 
-        SOP: 站上白线 + 连续两根中/大阳线 → 减半
-        阳线定义：close > open
-        额外条件：成交量不能明显萎缩
+        SOP: BBI 线上两根中大阳线 → 减半。中阳线指涨幅 4% 以上。
 
         Args:
             recent_klines: 最近的 K 线列表（至少 2 根）
-            white_line: 当前白线值
+            line_value: 当日离场线的值
+            prev_line_value: 前一日离场线的值，None 时用当日值
 
         Returns:
-            是否触发卤煮止盈
+            是否触发卤煮减半
         """
         if len(recent_klines) < 2:
             return False
 
         today = recent_klines[-1]
         yesterday = recent_klines[-2]
+        prev_line = line_value if prev_line_value is None else prev_line_value
 
-        # 条件 1: 当日站上白线
-        if today.close <= white_line:
+        if today.close <= line_value or yesterday.close <= prev_line:
             return False
 
-        # 条件 2: 连续两根阳线（close >= open，含十字星）
-        two_consecutive_yang = today.close >= today.open and yesterday.close >= yesterday.open
-        if not two_consecutive_yang:
-            return False
-
-        # 条件 3: 量能不萎缩（当日量不低于前日的 80%）
-        if yesterday.vol > 0 and today.vol < yesterday.vol * 0.8:
-            return False
-
-        return True
+        minimum = self.config.big_yang_pct
+        return (
+            today.close > today.open
+            and yesterday.close > yesterday.open
+            and today.pct_chg >= minimum
+            and yesterday.pct_chg >= minimum
+        )
 
     def check_white_line_exit(self, closes: list[float], white_values: list[float]) -> bool:
         """
-        Step 6: 检查白线两日破位（公开接口）
+        Step 6: 检查离场线两日破位（公开接口）
 
-        SOP: 收盘价连续两天跌破白线 → 清仓
-        白线 = EMA(EMA(C,10),10)，是 Z 哥的"牵牛绳"
+        SOP: 收盘价连续两天跌破离场线 → 清仓。离场线由 ``config.exit_line`` 决定。
 
         Args:
             closes: 最近 N 天的收盘价列表
-            white_values: 最近 N 天的白线值列表
+            white_values: 最近 N 天的离场线值列表
 
         Returns:
-            是否触发白线两日破位离场
+            是否触发两日破位离场
         """
         return detect_bbi_break_streak(
             closes, white_values, self.config.bbi_break_days, self.config.bbi_break_threshold
@@ -465,8 +507,7 @@ class ShaofuLoopEngine:
         Returns:
             信号字典（含 reason 字段）或 None
         """
-        sub = klines[: day_idx + 1]
-        return self.check_entry(sub)
+        return self.check_entry(self._prefix(klines, day_idx))
 
     def _check_stop_loss_internal(
         self,
@@ -496,6 +537,12 @@ class ShaofuLoopEngine:
                 return True
         return False
 
+    def _exit_line_value(self, sub: list[DailyData]) -> float:
+        """当前离场线的值（BBI 或白线）。"""
+        if self.config.exit_line == "white":
+            return calculate_zg_white(sub)
+        return calculate_bbi(sub)
+
     def _check_lu_zhu_internal(self, klines: list[DailyData], day_idx: int) -> bool:
         """
         内部卤煮检查
@@ -505,44 +552,42 @@ class ShaofuLoopEngine:
             day_idx: 当前日索引
 
         Returns:
-            是否触发卤煮止盈
+            是否触发卤煮减半
         """
-        if day_idx < 2:
+        if day_idx < 25:
             return False
 
-        sub = klines[: day_idx + 1]
-        if len(sub) < 24:
-            return False
-
-        white = calculate_zg_white(sub)
-        return self.check_lu_zhu(sub[-3:], white)
+        return self.check_lu_zhu(
+            [klines[day_idx - 1], klines[day_idx]],
+            self._exit_line_value(self._prefix(klines, day_idx)),
+            self._exit_line_value(self._prefix(klines, day_idx - 1)),
+        )
 
     def _check_white_line_exit_internal(self, klines: list[DailyData], day_idx: int) -> bool:
         """
-        内部白线破位检查
+        内部破位检查：收盘连续跌破离场线（BBI 或白线）
 
         Args:
             klines: K 线数据
             day_idx: 当前日索引
 
         Returns:
-            是否触发白线两日破位离场
+            是否触发两日破位离场
         """
         days_needed = self.config.bbi_break_days
         if day_idx < days_needed:
             return False
 
-        # 逐天计算白线并检查
         closes = []
-        white_values = []
+        line_values = []
         for i in range(day_idx - days_needed + 1, day_idx + 1):
-            sub = klines[: i + 1]
+            sub = self._prefix(klines, i)
             if len(sub) < 10:
                 return False
             closes.append(sub[-1].close)
-            white_values.append(calculate_zg_white(sub))
+            line_values.append(self._exit_line_value(sub))
 
-        return self.check_white_line_exit(closes, white_values)
+        return self.check_white_line_exit(closes, line_values)
 
     def _check_dead_cross_exit(self, klines: list[DailyData], day_idx: int) -> bool:
         """
@@ -558,7 +603,7 @@ class ShaofuLoopEngine:
         Returns:
             是否触发白线死叉黄线离场
         """
-        sub = klines[: day_idx + 1]
+        sub = self._prefix(klines, day_idx)
         if len(sub) < 20:
             return False
 
@@ -605,63 +650,190 @@ class ShaofuLoopEngine:
     # 离场检查（共享逻辑，消除 run_stock / process_day 重复）
     # ----------------------------------------------------------
 
-    def _close_trade(self, trade: LoopTrade, date: str, price: float, reason: str, pnl_pct: float) -> LoopTrade:
-        """平仓并返回已完成的交易"""
+    def _buy_cost(self) -> float:
+        """买入的费率（佣金 + 过户费）。"""
+        return self.config.commission_rate + self.config.transfer_fee_rate
+
+    def _sell_cost(self) -> float:
+        """卖出的费率（佣金 + 印花税 + 过户费）。"""
+        return self.config.commission_rate + self.config.stamp_duty_rate + self.config.transfer_fee_rate
+
+    def net_pnl_pct(self, trade: LoopTrade, exit_price: float) -> float:
+        """一笔交易的净收益（%）：含手续费，并把已减半卖出的部分算进去。"""
+        invested = trade.entry_price * (1 + self._buy_cost())
+        if invested <= 0:
+            return 0.0
+        proceeds = sum(leg["fraction"] * leg["price"] for leg in trade.partial_exits)
+        proceeds += trade.remaining_fraction * exit_price
+        return (proceeds * (1 - self._sell_cost()) / invested - 1) * 100
+
+    def _close_trade(self, trade: LoopTrade, date: str, price: float, reason: str, pnl_pct: float | None = None) -> LoopTrade:
+        """平仓并返回已完成的交易。不传 pnl_pct 时按净收益计算。"""
         trade.exit_date = date
         trade.exit_price = price
         trade.exit_reason = reason
-        trade.pnl_pct = pnl_pct
+        trade.pnl_pct = self.net_pnl_pct(trade, price) if pnl_pct is None else pnl_pct
         return trade
 
-    def _apply_exit_checks(
-        self, klines: list[DailyData], day_idx: int, trade: LoopTrade
-    ) -> tuple[LoopTrade | None, LoopTrade | None]:
-        """六层离场检查，返回 (更新后的持仓, 已完成的交易)
+    @staticmethod
+    def _limit_pct(klines: list[DailyData]) -> float:
+        """涨跌停幅度。ST 需要名称才能判断，这里只按代码分板块。"""
+        code = klines[0].ts_code
+        if code.startswith(("300", "301", "302", "688", "689")):
+            return 0.20
+        if code.startswith(("920", "430", "83", "87", "88")):
+            return 0.30
+        return 0.10
 
-        被 run_stock 和 process_day 共享调用。
-        """
-        current_price = klines[day_idx].close
-        pnl_pct = (current_price - trade.entry_price) / trade.entry_price * 100
+    def is_limit_up_open(self, klines: list[DailyData], day_idx: int) -> bool:
+        """开盘即涨停，买不进去。"""
+        prev_close = klines[day_idx - 1].close
+        return prev_close > 0 and klines[day_idx].open >= prev_close * (1 + self._limit_pct(klines)) * 0.999
+
+    def is_limit_down_open(self, klines: list[DailyData], day_idx: int) -> bool:
+        """开盘即跌停，卖不出去。"""
+        prev_close = klines[day_idx - 1].close
+        return prev_close > 0 and klines[day_idx].open <= prev_close * (1 - self._limit_pct(klines)) * 1.001
+
+    def _entry_index(self, klines: list[DailyData], trade: LoopTrade) -> int:
+        """买入 K 线下标；外部直接构造的交易没有这个字段，按日期查一次。"""
+        if trade.entry_index < 0:
+            trade.entry_index = next((i for i, k in enumerate(klines) if k.trade_date == trade.entry_date), 0)
+        return trade.entry_index
+
+    def _observe_close(self, klines: list[DailyData], day_idx: int, trade: LoopTrade) -> None:
+        """把 day_idx 这根收盘后的状态记到交易上。"""
+        bar = klines[day_idx]
+        pnl_pct = (bar.close - trade.entry_price) / trade.entry_price * 100
         trade.max_favorable = max(trade.max_favorable, pnl_pct)
         trade.max_adverse = min(trade.max_adverse, pnl_pct)
-        # v3.10.1：追踪入场后最高价（驱动移动止损上移）
-        current_high = klines[day_idx].high
-        trade.highest_after_entry = max(trade.highest_after_entry, current_high)
-        trade.holding_days += 1
+        trade.highest_after_entry = max(trade.highest_after_entry, bar.high)
+        trade.max_close = max(trade.max_close, bar.close)
+        trade.holding_days = day_idx - self._entry_index(klines, trade) + 1
+        if not trade.line_reclaimed and bar.close > self._exit_line_value(self._prefix(klines, day_idx)):
+            trade.line_reclaimed = True
+        if self.config.yellow_break_exit and not trade.yellow_reclaimed:
+            yellow = calculate_dg_yellow(self._prefix(klines, day_idx))
+            trade.yellow_reclaimed = yellow > 0 and bar.close > yellow
 
-        # 白线死叉黄线（无条件清仓）
-        if self._check_dead_cross_exit(klines, day_idx):
-            return None, self._close_trade(trade, klines[day_idx].trade_date, current_price, "白线死叉黄线", pnl_pct)
+    def _check_yellow_break(self, klines: list[DailyData], day_idx: int) -> bool:
+        """连续几根收盘都在黄线下（第一根可以忍，之后必须走）。"""
+        days = self.config.yellow_break_days
+        if day_idx < days:
+            return False
+        idxs = range(day_idx - days + 1, day_idx + 1)
+        yellows = [calculate_dg_yellow(self._prefix(klines, i)) for i in idxs]
+        return all(y > 0 for y in yellows) and detect_bbi_break_streak([klines[i].close for i in idxs], yellows, days, 0.0)
 
-        # 最少持仓天数保护（止损在保护期后才生效，避免入场次日被震出）
-        if trade.holding_days < self.config.min_holding_days:
+    def _check_s1(self, klines: list[DailyData], day_idx: int) -> bool:
+        sub = self._prefix(klines, day_idx)
+        return detect_s1(sub, len(sub) - 1) is not None
+
+    def _check_fourth_brick(self, klines: list[DailyData], day_idx: int) -> bool:
+        """今天正好是第四块红砖。砖值的递推 80 根已经收敛。"""
+        return red_brick_streak(klines[max(0, day_idx - 79) : day_idx + 1]) == 4
+
+    def exit_reason(self, klines: list[DailyData], day_idx: int, trade: LoopTrade) -> str:
+        """按七层应对的优先级检查 day_idx 收盘后是否该离场，返回原因（空串表示继续持有）。"""
+        cfg = self.config
+        if trade.holding_days < cfg.min_holding_days:
+            return ""
+
+        close = klines[day_idx].close
+
+        # 第 1 层：没涨就走（入场后收盘从未高于成本）
+        if (
+            cfg.no_rise_days > 0
+            and trade.holding_days >= cfg.no_rise_days + cfg.no_rise_grace_days
+            and trade.max_close <= trade.entry_price
+        ):
+            return "没涨就走"
+
+        # 第 2 层：盈转亏必走
+        if cfg.profit_to_loss_exit and trade.max_close > trade.entry_price and close < trade.entry_price:
+            return "盈转亏"
+
+        # 第 3 层：止损
+        if self._check_stop_loss_internal(klines, day_idx, trade):
+            return "止损"
+
+        # 第 5 层：S1 与嘀嘀
+        if cfg.s1_exit and self._check_s1(klines, day_idx):
+            return "S1"
+        if cfg.didi_exit and detect_didi(self._prefix(klines, day_idx))["is_didi"]:
+            return "嘀嘀"
+
+        # 第 6 层：破位（跌破的前提是站上过）
+        if (not cfg.break_requires_reclaim or trade.line_reclaimed) and self._check_white_line_exit_internal(klines, day_idx):
+            return "白线跌破" if cfg.exit_line == "white" else "BBI跌破"
+        if cfg.yellow_break_exit and trade.yellow_reclaimed and self._check_yellow_break(klines, day_idx):
+            return "破黄线"
+
+        # 第 7 层：死叉
+        if cfg.dead_cross_exit and self._check_dead_cross_exit(klines, day_idx):
+            return "白线死叉黄线"
+
+        return ""
+
+    def _manage_position(
+        self, klines: list[DailyData], day_idx: int, trade: LoopTrade
+    ) -> tuple[LoopTrade | None, LoopTrade | None]:
+        """持仓处理：用昨日收盘决定动作，今日开盘成交。"""
+        decision_idx = day_idx - 1
+        if decision_idx < self._entry_index(klines, trade):
             return trade, None
 
-        # Step 4: 收盘价止损
-        if self._check_stop_loss_internal(klines, day_idx, trade):
-            return None, self._close_trade(trade, klines[day_idx].trade_date, current_price, "止损", pnl_pct)
+        self._observe_close(klines, decision_idx, trade)
+        reason = trade.pending_exit_reason or self.exit_reason(klines, decision_idx, trade)
+        bar = klines[day_idx]
 
-        # Step 6: 白线两日破位
-        if self._check_white_line_exit_internal(klines, day_idx):
-            return None, self._close_trade(trade, klines[day_idx].trade_date, current_price, "白线跌破", pnl_pct)
-
-        # Step 5: 卤煮止盈
-        if self._check_lu_zhu_internal(klines, day_idx):
-            if self.config.lu_half:
-                trade.partial_exits.append(
-                    {
-                        "date": klines[day_idx].trade_date,
-                        "price": current_price,
-                        "pnl_pct": pnl_pct,
-                        "type": "卤煮减半",
-                    }
-                )
-                trade.entry_reason += " [已卤煮减半]"
+        if reason:
+            if self.is_limit_down_open(klines, day_idx):
+                trade.pending_exit_reason = reason
                 return trade, None
-            else:
-                return None, self._close_trade(trade, klines[day_idx].trade_date, current_price, "卤煮止盈", pnl_pct)
+            fill = bar.open * (1 - self.config.slippage_pct)
+            return None, self._close_trade(trade, bar.trade_date, fill, reason)
+
+        # 第 4 层：放飞。两种减半各一次，同一天只减一次
+        done = {leg["type"] for leg in trade.partial_exits}
+        kind = ""
+        if self.config.lu_half and "卤煮减半" not in done and self._check_lu_zhu_internal(klines, decision_idx):
+            kind = "卤煮减半"
+        elif self.config.fourth_brick_half and "第四块砖" not in done and self._check_fourth_brick(klines, decision_idx):
+            kind = "第四块砖"
+        if kind and not self.is_limit_down_open(klines, day_idx):
+            fill = bar.open * (1 - self.config.slippage_pct)
+            trade.partial_exits.append({"date": bar.trade_date, "price": fill, "fraction": trade.remaining_fraction / 2, "type": kind})
+            trade.remaining_fraction /= 2
+            trade.entry_reason += f" [已{kind}]"
 
         return trade, None
+
+    def _try_enter(self, ts_code: str, klines: list[DailyData], day_idx: int) -> LoopTrade | None:
+        """用昨日收盘判断 B1，今日开盘买入。"""
+        signal = self._check_entry_internal(klines, day_idx - 1)
+        if signal is None or self.is_limit_up_open(klines, day_idx):
+            return None
+        bar = klines[day_idx]
+        return LoopTrade(
+            ts_code=ts_code,
+            entry_date=bar.trade_date,
+            entry_price=bar.open * (1 + self.config.slippage_pct),
+            entry_reason=signal.get("reason", "B1信号"),
+            # 买入 K 线的最低价要等它收盘才确定，止损也从这根收盘开始检查
+            stop_loss_price=_calc_stop_loss_price(
+                klines,
+                day_idx,
+                self.config.stop_loss_method,
+                self.config.stop_loss_pct,
+                atr_multiplier=self.config.atr_stop_multiplier,
+                atr_window=self.config.atr_stop_window,
+            ),
+            position_pct=self.config.position_pct,
+            triggered_strategies=list(signal.get("triggered_strategies") or []),
+            signal_strength=float(signal.get("signal_strength") or 0.0),
+            entry_index=day_idx,
+        )
 
     # ----------------------------------------------------------
     # 多策略共振（合并自 loop_engine_enhanced.py；默认关闭以保持原 B1 单策略行为）
@@ -718,12 +890,21 @@ class ShaofuLoopEngine:
     # ----------------------------------------------------------
     # 主循环
     # ----------------------------------------------------------
-    def run_stock(self, klines: list[DailyData], ts_code: str = "") -> list[LoopTrade]:
+    def run_stock(
+        self,
+        klines: list[DailyData],
+        ts_code: str = "",
+        market_filter: dict[str, bool] | None = None,
+    ) -> list[LoopTrade]:
         """对一只股票运行完整的六步闭环
 
-        从第 30 根 K 线开始，自动完成入场→持仓→离场的循环。
+        Args:
+            klines: K 线（升序）
+            ts_code: 股票代码，默认取 K 线上的
+            market_filter: 择时结果 {信号日: 能否开仓}；None 表示不择时，
+                字典里没有的日期视为不能开仓
         """
-        if not klines or len(klines) < 30:
+        if not klines or len(klines) < 31:
             return []
 
         if not ts_code:
@@ -732,36 +913,17 @@ class ShaofuLoopEngine:
         completed_trades: list[LoopTrade] = []
         current_trade: LoopTrade | None = None
 
-        for day_idx in range(30, len(klines)):
-            if current_trade is None:
-                signal = self._check_entry_internal(klines, day_idx)
-                if signal is not None:
-                    entry_price = klines[day_idx].close
-                    stop_loss = _calc_stop_loss_price(
-                        klines, day_idx, self.config.stop_loss_method, self.config.stop_loss_pct
-                    )
-                    current_trade = LoopTrade(
-                        ts_code=ts_code,
-                        entry_date=klines[day_idx].trade_date,
-                        entry_price=entry_price,
-                        entry_reason=signal.get("reason", "B1信号"),
-                        stop_loss_price=stop_loss,
-                        position_pct=self.config.position_pct,
-                        triggered_strategies=list(signal.get("triggered_strategies") or []),
-                        signal_strength=float(signal.get("signal_strength") or 0.0),
-                    )
-            else:
-                current_trade, completed = self._apply_exit_checks(klines, day_idx, current_trade)
-                if completed:
-                    completed_trades.append(completed)
-                    current_trade = None
-                    continue
+        for day_idx in range(31, len(klines)):
+            allow_entry = market_filter is None or market_filter.get(klines[day_idx - 1].trade_date, False)
+            current_trade, completed = self.process_day(ts_code, klines, day_idx, current_trade, allow_entry=allow_entry)
+            if completed is not None:
+                completed_trades.append(completed)
 
-        # 数据末尾：强制平仓
-        if current_trade is not None and klines:
+        # 数据末尾：按最后收盘价结算，标记出来便于统计时区分
+        if current_trade is not None:
             last = klines[-1]
-            pnl_pct = (last.close - current_trade.entry_price) / current_trade.entry_price * 100
-            completed_trades.append(self._close_trade(current_trade, last.trade_date, last.close, "数据末尾", pnl_pct))
+            self._observe_close(klines, len(klines) - 1, current_trade)
+            completed_trades.append(self._close_trade(current_trade, last.trade_date, last.close, "数据末尾"))
 
         return completed_trades
 
@@ -771,32 +933,20 @@ class ShaofuLoopEngine:
         klines: list[DailyData],
         day_idx: int,
         current_trade: LoopTrade | None = None,
+        allow_entry: bool = True,
     ) -> tuple[LoopTrade | None, LoopTrade | None]:
-        """处理单日数据（供外部精细控制调用）
+        """处理单日开盘的动作：用昨日收盘的结论，在今日开盘买入或卖出。
 
         Returns:
             (updated_trade, completed_trade)
         """
-        if day_idx < 30 or day_idx >= len(klines):
+        if day_idx < 31 or day_idx >= len(klines):
             return current_trade, None
 
         if current_trade is None:
-            signal = self._check_entry_internal(klines, day_idx)
-            if signal is not None:
-                entry_price = klines[day_idx].close
-                stop_loss = _calc_stop_loss_price(klines, day_idx, self.config.stop_loss_method)
-                new_trade = LoopTrade(
-                    ts_code=ts_code,
-                    entry_date=klines[day_idx].trade_date,
-                    entry_price=entry_price,
-                    entry_reason=signal.get("reason", "B1信号"),
-                    stop_loss_price=stop_loss,
-                    position_pct=self.config.position_pct,
-                )
-                return new_trade, None
-            return None, None
+            return (self._try_enter(ts_code, klines, day_idx) if allow_entry else None), None
 
-        return self._apply_exit_checks(klines, day_idx, current_trade)
+        return self._manage_position(klines, day_idx, current_trade)
 
 
 # ============================================================
@@ -813,8 +963,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--j-threshold",
         type=float,
-        default=12,
-        help="B1 J 值阈值（默认 12）",
+        default=rule_value("j_threshold"),
+        help="B1 J 值阈值",
     )
     parser.add_argument(
         "--stop-loss-method",
@@ -826,7 +976,7 @@ if __name__ == "__main__":
         "--bbi-days",
         type=int,
         default=2,
-        help="BBI 连续跌破天数（默认 2）",
+        help="离场线连续跌破天数（默认 2）",
     )
 
     args = parser.parse_args()
@@ -850,14 +1000,14 @@ if __name__ == "__main__":
         klines.append(
             DailyData(
                 ts_code=args.ts_code,
-                trade_date=k.get("trade_date", ""),
-                open=float(k.get("open", 0)),
-                high=float(k.get("high", 0)),
-                low=float(k.get("low", 0)),
-                close=float(k.get("close", 0)),
-                vol=float(k.get("vol", 0)),
-                amount=float(k.get("amount", 0)),
-                pct_chg=float(k.get("pct_chg", 0)),
+                trade_date=k.trade_date,
+                open=k.open,
+                high=k.high,
+                low=k.low,
+                close=k.close,
+                vol=k.vol,
+                amount=k.amount,
+                pct_chg=k.pct_chg,
             )
         )
 

@@ -10,9 +10,11 @@ from modules.verify.gates import (
 from modules.verify.pipeline import AggregateMetrics
 
 
-def test_thresholds_are_five_items():
-    """5 项硬指标都要在 THRESHOLDS 里"""
-    assert len(THRESHOLDS) == 5
+def test_thresholds_items():
+    """硬指标都要在 THRESHOLDS 里（5 项收益风险 + 最少笔数 + 随机入场对照）"""
+    assert len(THRESHOLDS) == 7
+    assert "total_trades" in THRESHOLDS
+    assert "edge_vs_random" in THRESHOLDS
     assert "sharpe" in THRESHOLDS
     assert "calmar" in THRESHOLDS
     assert "win_rate" in THRESHOLDS

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import logging
 from pathlib import Path
 
@@ -87,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ts-codes",
         type=str,
         default=None,
-        help="指定股票列表（逗号分隔），默认从 stock_basic 选前 N 只",
+        help="指定股票列表（逗号分隔），默认固定种子随机抽 N 只",
     )
     parser.add_argument(
         "--json",
@@ -128,6 +129,23 @@ def _validate_params(
     for value, (lo, hi), name in checks:
         if not lo <= value <= hi:
             raise ZettarancError(ErrorCode.INVALID_PARAM, f"{name} 必须在 [{lo}, {hi}]，当前 {value}")
+
+
+def select_verify_universe(limit: int, seed: int = 20261031) -> list[str]:
+    """验收股票池：固定种子随机抽样。
+
+    此前取 stock_basic 按代码排序的前 N 只，全是深市老股。这里也不按当前简称或
+    当前是否有行情过滤：那是用今天的状态筛历史样本，会带来幸存者偏差。
+    本地文件里仍在的已停牌、已退市股票会被保留，文件已删除的无法还原。
+    """
+    from modules.datasource import get_datasource
+    from modules.database import get_all_stock_codes
+
+    stocks = get_datasource().get_stock_list()
+    codes = sorted(s["ts_code"] for s in stocks if s.get("market") in ("主板", "创业板", "科创板", None))
+    if not codes:
+        return get_all_stock_codes(limit=limit)
+    return random.Random(seed).sample(codes, min(limit, len(codes)))
 
 
 def _split_ts_codes(ts_codes_arg: str | None) -> list[str]:
@@ -209,11 +227,7 @@ def run_verify_v10_command(
             print(f"参数错误：{e}")
         return 2
 
-    ts_codes = _split_ts_codes(ts_codes_arg)
-    if not ts_codes:
-        from modules.database import get_all_stock_codes
-
-        ts_codes = get_all_stock_codes(limit=limit)
+    ts_codes = _split_ts_codes(ts_codes_arg) or select_verify_universe(limit)
 
     result = run_verify_v10(
         ts_codes=ts_codes,

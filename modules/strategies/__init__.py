@@ -369,10 +369,11 @@ def detect_all_strategies(ts_code: str, days: int = 120, klines: list | None = N
         wave = detect_three_waves(daily_klines)
         if wave["wave"] != "未知" and wave["confidence"] >= 0.5:
             wave_map = {
+                # 波次只说阶段，买点要另外满足 B1 条件（低 J 等），这里不发买入信号
                 "建仓波": (
-                    StrategyType.B1,
-                    Action.BUY,
-                    f"三波理论·建仓波：{wave['stats']['gain_pct']}% 涨幅，B1可干",
+                    StrategyType.WATCH,
+                    Action.WATCH,
+                    f"三波理论·建仓波：{wave['stats']['gain_pct']}% 涨幅，阶段可做B1，买点看B1条件",
                 ),
                 "拉升波": (
                     StrategyType.WATCH,

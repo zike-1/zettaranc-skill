@@ -153,7 +153,9 @@
 | `b1_volume_shrink` | bool | B1 当日是否缩量 |
 | `b1_score` | int | B1 评分（0-4，满足条件数） |
 | `b1_rally_pct` | float | 建仓波涨幅（%） |
-| `b1_pass_30` | bool | 是否通过两个30%原则（涨幅25%-40%） |
+| `b1_turnover` | float \| None | 近 30 天最大三根阳量的累计换手（%），没有换手数据时为 None |
+| `b1_pass_30` | bool | 涨幅和累计换手是否都不超过 30% |
+| `b1_30_status` | str | 通过 / 偏高 / 废B1 / 换手未知 / 数据不足 |
 | `is_b2` | bool | B2 突破信号 |
 | `b2_follows_b1` | bool | 是否在 B1 后5天内 |
 | `b2_pct_chg` | float | B2 涨幅 |

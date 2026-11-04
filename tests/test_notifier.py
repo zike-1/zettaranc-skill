@@ -38,7 +38,7 @@ def test_notify_feishu(mock_post):
 
 @patch("modules.notifier.notify_macos")
 @patch("modules.notifier.notify_feishu")
-@patch("os.uname")
+@patch("os.uname", create=True)  # Windows 上 os 没有 uname
 def test_notify_all_mac(mock_uname, mock_feishu, mock_macos):
     # 模拟在 macOS (Darwin) 环境下
     mock_uname.return_value = MagicMock(sysname="Darwin")
@@ -54,7 +54,7 @@ def test_notify_all_mac(mock_uname, mock_feishu, mock_macos):
 
 @patch("modules.notifier.notify_macos")
 @patch("modules.notifier.notify_feishu")
-@patch("os.uname")
+@patch("os.uname", create=True)  # Windows 上 os 没有 uname
 def test_notify_all_linux(mock_uname, mock_feishu, mock_macos):
     # 模拟在 Linux 环境下 (不触发 macOS 通知)
     mock_uname.return_value = MagicMock(sysname="Linux")

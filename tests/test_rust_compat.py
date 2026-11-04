@@ -5,12 +5,13 @@ import importlib
 import pytest
 
 
-def test_default_is_rust(monkeypatch):
+def test_default_is_python(monkeypatch):
+    """Rust 引擎没有按知识库规则更新，默认必须走 Python。"""
     monkeypatch.delenv("ZETTARANC_BACKTEST_IMPL", raising=False)
     from modules.core import _rust_compat
 
     importlib.reload(_rust_compat)
-    assert _rust_compat.get_impl_choice() == "rust"
+    assert _rust_compat.get_impl_choice() == "python"
 
 
 def test_invalid_impl_raises(monkeypatch):

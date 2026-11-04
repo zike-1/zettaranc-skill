@@ -8,16 +8,18 @@ v3.10.4: 接入 ZettarancError
 import logging
 import os
 import pickle
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
 from ..database import get_db_connection
 from ..datasource import DataSource, daily_to_dict
 from ..indicators import DailyData
+from ..tdx_local_client import TdxLocalClient, configured_root, local_stock_name
 from modules.core.errors import ErrorCode, ZettarancError
 
 from .criteria import _CRITERIA_REGISTRY, _check_centipede, _check_sandglass_min
-from .data import get_all_stocks, get_recent_klines
+from .data import get_all_stocks, get_recent_klines, select_tradable
 from .models import StockScore
 from .scoring import (
     is_perfect_pattern,
@@ -61,12 +63,14 @@ def analyze_stock(
         return StockScore(ts_code=ts_code)
 
     # 获取股票名称
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM stock_basic WHERE ts_code = ?", (ts_code,))
-    row = cursor.fetchone()
-    name = row["name"] if row else ts_code
-    conn.close()
+    name = local_stock_name(ts_code)
+    if name is None:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM stock_basic WHERE ts_code = ?", (ts_code,))
+        row = cursor.fetchone()
+        name = row["name"] if row else ts_code
+        conn.close()
 
     # 计算各项评分
     b1_score, b1_reasons = score_b1_opportunity(klines)
@@ -175,6 +179,43 @@ def _analyze_worker(
     return ts_code, klines, score
 
 
+def _screen_worker(ts_code: str, criteria: str, datasource: DataSource | None = None) -> StockScore | None:
+    """并行 worker：评分并筛选单只股票，只把命中的评分传回主进程。
+
+    把筛选放进 worker，避免 5000 多只股票的 K 线在进程间来回序列化。
+    """
+    result = _analyze_worker(ts_code, datasource=datasource)
+    if result and _filter_stock(result, criteria):
+        return result[2]
+    return None
+
+
+def _lower_process_priority() -> None:
+    """把选股子进程降到低优先级，全市场扫描时不影响用户用电脑。"""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            below_normal = 0x00004000
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), below_normal)
+        else:
+            os.nice(5)
+    except OSError as e:
+        logger.debug("[engine] 降低进程优先级失败: %s", e)
+
+
+def _prepare_local_data() -> None:
+    """配置了通达信目录时预热除权数据缓存。"""
+    root = configured_root()
+    if root is not None:
+        TdxLocalClient(root).prepare()
+
+
+def _default_workers() -> int:
+    """默认只用约三分之一的逻辑核，最多 8 个进程。"""
+    return min(8, max(2, (os.cpu_count() or 4) // 3))
+
+
 def _filter_stock(result: tuple[str, list, StockScore], criteria: str) -> bool:
     """判断单只股票是否满足选股条件（注册表分发模式）"""
     ts_code, klines, score = result
@@ -199,6 +240,8 @@ def screen_stocks(
     max_workers: int = 0,
     use_parallel: bool = True,
     datasource: DataSource | None = None,
+    include_st: bool = False,
+    meta: dict | None = None,
 ) -> list[StockScore]:
     """
     选股筛选（支持多进程并行）
@@ -220,8 +263,10 @@ def screen_stocks(
     - "volume_ratio_super": 量比战法（立即买或强势攻击场景）
 
     max_stocks: 最大扫描数量，0=全量（全市场约 5200 只，实测 4 秒级，无需限量）
-    max_workers: 并行进程数，0=自动（CPU核心数）
+    max_workers: 并行进程数，0=自动（约三分之一逻辑核，最多 8 个）
     use_parallel: 是否启用多进程并行（<50只时自动关闭；注入的 datasource 需可 pickle）
+    include_st: 是否保留 ST 股票（按当前简称判断），默认剔除
+    meta: 传入 dict 时写入本次扫描的统计（as_of、universe、skipped_*、scanned）
 
     返回：满足条件的 StockScore 列表（按评分降序）
 
@@ -237,10 +282,13 @@ def screen_stocks(
             f"未知选股条件: {criteria!r}，可选: {valid}",
         )
 
-    stocks = get_all_stocks(datasource=datasource)
-    # 0（或负数）= 全市场。指标走 indicator_cache，全市场实测秒级，不再做性能截断
+    stocks, stats = select_tradable(get_all_stocks(datasource=datasource), include_st=include_st)
+    # 0（或负数）= 全市场
     limit = max_stocks if max_stocks > 0 else len(stocks)
     stocks = stocks[:limit]
+    stats["scanned"] = len(stocks)
+    if meta is not None:
+        meta.update(stats)
 
     # v3.10.4: 股票池彻底为空 → 抛 SCREENER_NO_DATA
     if not stocks:
@@ -267,16 +315,18 @@ def screen_stocks(
                 results.append(result[2])
     else:
         # 并行模式：只并行 analyze_stock，筛选在主进程串行
-        workers = max_workers or os.cpu_count() or 4
+        workers = max_workers or _default_workers()
         try:
             ts_codes = [s["ts_code"] for s in stocks]
+            # 先在主进程把 gbbq 缓存建好，避免每个子进程各解密一次
+            _prepare_local_data()
 
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                future_map = {executor.submit(_analyze_worker, ts_code, datasource): ts_code for ts_code in ts_codes}
+            with ProcessPoolExecutor(max_workers=workers, initializer=_lower_process_priority) as executor:
+                future_map = {executor.submit(_screen_worker, ts_code, criteria, datasource): ts_code for ts_code in ts_codes}
                 for future in as_completed(future_map):
-                    result = future.result()
-                    if result and _filter_stock(result, criteria):
-                        results.append(result[2])
+                    score = future.result()
+                    if score is not None:
+                        results.append(score)
         except (OSError, RuntimeError, BrokenProcessPool, ValueError, KeyError) as e:
             # 并行失败回退到串行；调用方已知失败会降级处理。
             logger.warning("[engine] 并行执行失败，降级为串行: %s", e)

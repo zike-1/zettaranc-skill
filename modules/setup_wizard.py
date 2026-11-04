@@ -60,31 +60,30 @@ def write_env_file(token: str | None = None, mode: str = MODE_NORMAL, env_path: 
     if env_path is None:
         env_path = Path(__file__).parent.parent / ".env"
 
-    lines = [
-        "# 数据模式: jnb(JNB模式/走Tushare API) 或 websearch(普通小万模式/走网络搜索)",
-        f"DATA_MODE={mode}",
-        "",
-    ]
-
+    # 只改这次要设置的键。此前整份覆盖，会丢掉 TUSHARE_API_URL、LLM_API_KEY、
+    # TDX_DIR 等其他配置，JNB 模式因此静默退回免费源。
+    updates = {"DATA_MODE": mode}
     if token:
-        lines.extend(
-            [
-                "# Tushare API 配置",
-                f"TUSHARE_TOKEN={token}",
-                "",
-            ]
-        )
+        updates["TUSHARE_TOKEN"] = token
+    defaults = {"DATA_DIR": "data", "DB_PATH": "data/stock_data.db"}
 
-    lines.extend(
-        [
-            "# 数据库路径（相对于项目根目录）",
-            "DATA_DIR=data",
-            "DB_PATH=data/stock_data.db",
-            "",
-        ]
-    )
+    existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in existing:
+        key = line.split("=", 1)[0].strip()
+        if "=" in line and not line.lstrip().startswith("#") and key in updates:
+            lines.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            if "=" in line and not line.lstrip().startswith("#"):
+                seen.add(key)
+            lines.append(line)
+    for key, value in {**updates, **defaults}.items():
+        if key not in seen:
+            lines.append(f"{key}={value}")
 
-    env_path.write_text("\n".join(lines), encoding="utf-8")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # 同时设置环境变量，使当前会话立即生效
     os.environ["DATA_MODE"] = mode

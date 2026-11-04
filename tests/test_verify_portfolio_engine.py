@@ -180,12 +180,12 @@ class TestPortfolioBacktestEngine:
         )
         klines = _make_klines(
             "600519.SH",
-            ["20260101", "20260102", "20260103"],
-            [100.0, 101.0, 102.0],
+            ["20260101", "20260102", "20260103", "20260104"],
+            [100.0, 101.0, 102.0, 103.0],
         )
         monkeypatch.setattr(engine, "_load_klines", lambda *args, **kwargs: {"600519.SH": klines})
 
-        # 第二天买入（v3.10.0 多策略接口：只在 20260102 返回信号）
+        # 20260102 收盘出信号，20260103 开盘买入
         def mock_check_multi_entry(klines_arg, idx, enabled):
             if idx >= 1 and klines_arg[idx].trade_date == "20260102":
                 return [EntrySignal(strategy="B1", confidence=0.9, reason="J=-15", stop_loss_price=97.0)]
@@ -193,9 +193,9 @@ class TestPortfolioBacktestEngine:
 
         monkeypatch.setattr(engine, "_check_multi_entry", mock_check_multi_entry)
 
-        # 第三天平仓，盈利 10%
+        # 20260104 平仓，盈利 10%
         def mock_process_day(ts_code, klines, day_idx, current_trade):
-            if klines[day_idx].trade_date == "20260103" and current_trade is not None:
+            if klines[day_idx].trade_date == "20260104" and current_trade is not None:
                 completed = LoopTrade(
                     ts_code=ts_code,
                     entry_date=current_trade.entry_date,
@@ -214,7 +214,7 @@ class TestPortfolioBacktestEngine:
 
         monkeypatch.setattr(engine.loop_engine, "process_day", mock_process_day)
 
-        result = engine.run(["600519.SH"], days=3)
+        result = engine.run(["600519.SH"], days=4)
         assert result.total_trades == 1
         assert result.win_count == 1
         assert result.net_values[-1] > 1_000_000.0

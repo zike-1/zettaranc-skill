@@ -197,6 +197,7 @@ def bridge_shaofu_single(
     days: int = 250,
     klines: list | None = None,
     config: dict | None = None,
+    market_filter: dict[str, bool] | None = None,
 ) -> dict:
     """单股少妇战法回测（CLI 用）。
 
@@ -214,7 +215,8 @@ def bridge_shaofu_single(
     """
     # is_rust_available() 内部捕获 RuntimeError（impl=rust 但模块缺失时），
     # 保证 silent fallback；否则直接走 compute_func 会在 rust 模式下抛 RuntimeError
-    if is_rust_available():
+    # Rust 引擎不支持择时，要择时只能走 Python
+    if market_filter is None and is_rust_available():
         fn_obj = compute_func("run_single_strategy_backtest_py")
         if fn_obj is not None:
             # compute_func 返回 object | None；强制标为 Callable 让调用通过 mypy
@@ -244,7 +246,10 @@ def bridge_shaofu_single(
     from modules.backtest.shaofu import backtest_shaofu_single
     from modules.cli_commands import _shaofu_result_to_dict
 
-    result = backtest_shaofu_single(ts_code, days=days, klines=klines)
+    if market_filter is None:
+        result = backtest_shaofu_single(ts_code, days=days, klines=klines)
+    else:
+        result = backtest_shaofu_single(ts_code, days=days, klines=klines, market_filter=market_filter)
     return _shaofu_result_to_dict(result)
 
 
