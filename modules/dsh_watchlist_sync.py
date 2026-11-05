@@ -16,11 +16,11 @@ DEFAULT_GROUP = "今日选股"
 
 
 def default_picks_file() -> Path | None:
-    """DSH_REPORT_PICKS_FILE，或 DSH_HOME 下的 report-picks.json；都没配置时不交给工作台。"""
+    """DSH_REPORT_PICKS_FILE，或工作台目录（ZT_DSH_HOME，其次 DSH_HOME）下的 report-picks.json；都没配置时不交给工作台。"""
     explicit = os.environ.get("DSH_REPORT_PICKS_FILE", "").strip()
     if explicit:
         return Path(explicit)
-    home = os.environ.get("DSH_HOME", "").strip()
+    home = os.environ.get("ZT_DSH_HOME", "").strip() or os.environ.get("DSH_HOME", "").strip()
     return Path(home) / "report-picks.json" if home else None
 
 
@@ -56,7 +56,7 @@ def write_picks_file(picks: list[dict], date: str, path: Path | None = None, gro
     path = path or default_picks_file()
     result = SyncResult(group=group, path=str(path or ""), symbols=[p["symbol"] for p in payload["picks"]])
     if path is None:
-        result.error = "没有配置 DSH 工作台（.env 里的 DSH_HOME 或 DSH_REPORT_PICKS_FILE）"
+        result.error = "没有配置 DSH 工作台（.env 里的 ZT_DSH_HOME 或 DSH_REPORT_PICKS_FILE）"
         return result
     if not path.parent.is_dir():
         result.error = f"工作台目录不存在：{path.parent}"

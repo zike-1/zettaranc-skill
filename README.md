@@ -277,7 +277,7 @@ ZHINANZHEN_DATA_DIR=D:/Program Files/WavMain/ANALYSE/Data/ChinaStk
 REPORT_OUT_DIR=D:/stock/reports
 ZT_REPORT_BLOCKS=我的B1,我的搬砖
 ZT_TDX_FORMULA_MAP=我的B1=通达信里的B1公式名,我的搬砖=通达信里的搬砖公式名
-DSH_HOME=D:/dsh-home          # 用 DSH 交易终端时
+ZT_DSH_HOME=D:/dsh-home       # 用 DSH 交易终端时（也认 DSH_HOME，但系统里同名的环境变量会盖过 .env）
 ```
 
 路径都按你自己的安装位置填。
@@ -324,7 +324,14 @@ python -m modules.cli report --refresh-amv   # 先打开指南针更新活跃市
 
 ### 与 DSH 交易终端联动
 
-设了 `DSH_HOME` 后：报告读 `watchlists.json` 里「持仓」分组的股票；生成报告时把入选名单写成 `DSH_HOME/report-picks.json`，终端每分钟检查一次，同步进「今日选股」分组（只删它自己加的行，你手动加的自选不动）。终端侧的配置见 dsh-trading fork 的 `docs/guides/a-share-local-data.md`。
+设了 `ZT_DSH_HOME`（或 `DSH_HOME`）后：报告读 `watchlists.json` 里「持仓」分组的股票；生成报告时把入选名单写成 `<工作台目录>/report-picks.json`，终端每分钟检查一次，同步进「今日选股」分组（只删它自己加的行，你手动加的自选不动）。终端侧的配置见 dsh-trading fork 的 `docs/guides/a-share-local-data.md`。
+
+> 系统里如果已经有给其他 DSH 安装用的 `DSH_HOME` 环境变量，它会盖过 `.env` 里的同名设置，所以技能优先读自己的 `ZT_DSH_HOME`。
+
+工作台还会调用这两个只读命令（都输出一行 JSON）：
+
+- `python -m modules.cli review --codes 600795.SH,00700.HK [--source 公式名] [--date YYYYMMDD]`：按每日报告的规则复核几只股票（选股页签的过滤、Z哥诊断浮窗）。代码保留交易所（`000001.SH` 是上证指数）；给了 `--date` 时，本地数据早于这一天的标「待复核」，不参与剔除。港股按同一套规则算，只作参考：规则按 A 股调参，本地没有港股除权记录（不复权）。
+- `python -m modules.cli forward-test [--out 报告目录]`：前向检验。每天报告里的入选股，入选后第 5 / 10 个交易日（按上证交易日历数，停牌股取结束日前最后一根收盘）的表现，对比同日随机基准（报告当天沪深主板、上市满 120 根的全部个股平均）、上证和被剔除的票；平均收益、基准、超额都按交易日等权，至少 20 个完成的交易日、区间不跨 0 才算有结论。
 
 ### 知识库与出处
 

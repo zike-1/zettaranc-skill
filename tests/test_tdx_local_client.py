@@ -417,3 +417,21 @@ def test_etf_history_starts_after_last_share_split():
 def test_is_etf_by_code_range():
     assert tdx.is_etf("sh588200") and tdx.is_etf("sh510300") and tdx.is_etf("sz159915")
     assert not tdx.is_etf("sh600795") and not tdx.is_etf("sz000001")
+
+
+def test_hong_kong_daily_bars_from_extended_market(tmp_path):
+    """港股：vipdoc/ds/lday/31#00700.day，float 价格、成交量按手；5 位代码按港股认"""
+    import numpy as np
+
+    from modules.tdx_local_client import _DS_DAY_DTYPE, TdxLocalClient, to_symbol
+
+    folder = tmp_path / "vipdoc" / "ds" / "lday"
+    folder.mkdir(parents=True)
+    bars = np.zeros(2, dtype=_DS_DAY_DTYPE)
+    for i, (d, o, h, low, c, vol) in enumerate([(20261103, 393.2, 402.6, 391.8, 397.2, 201402), (20261104, 397.8, 402.2, 391.6, 401.6, 185001)]):
+        bars[i] = (d, o, h, low, c, c * vol * 100, vol, 0)
+    bars.tofile(folder / "31#00700.day")
+    assert to_symbol("00700.HK") == "hk00700" and to_symbol("00700") == "hk00700"
+    series = TdxLocalClient(tmp_path).raw_series("00700.HK")
+    assert list(series["date"]) == [20261103, 20261104]
+    assert series["close"][-1] == 401.6 and series["volume_shares"][-1] == 18500100

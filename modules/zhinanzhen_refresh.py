@@ -60,16 +60,38 @@ class RefreshResult:
         return self.after >= self.target
 
 
-def latest_amv_date() -> str:
-    """0AMV 最新一行的日期（YYYY-MM-DD）；读不到为空串。"""
+def read_amv_date() -> tuple[str, bool]:
+    """(0AMV 最新一行的日期 YYYY-MM-DD, 文件被占用)。读不到日期为空串。
+
+    指南针开着时独占 Z_SK/day.vdat，读会报 PermissionError（2026-11-04 晚实测，整段 180 秒都读不了），
+    这不是没有数据，调用方等它退出后再读。
+    """
     from modules import compass_vdat
 
     try:
         rows = compass_vdat.read_amv_rows()
+    except PermissionError:
+        return "", True
     except Exception as e:  # noqa: BLE001 — 读失败按「没有数据」处理，原因记日志
         logger.warning("读取活跃市值失败: %s", e)
-        return ""
-    return rows[-1]["date"] if rows else ""
+        return "", False
+    return (rows[-1]["date"] if rows else ""), False
+
+
+def latest_amv_date() -> str:
+    """0AMV 最新一行的日期（YYYY-MM-DD）；读不到（含指南针占着文件）为空串。"""
+    return read_amv_date()[0]
+
+
+def amv_file_mtime() -> float:
+    """day.vdat 的修改时间（秒）；没配置或读不到为 0。指南针占着文件时也能读到修改时间。"""
+    from modules import compass_vdat
+
+    root = compass_vdat.configured_data_dir()
+    try:
+        return (root / "Z_SK" / "day.vdat").stat().st_mtime if root is not None else 0.0
+    except OSError:
+        return 0.0
 
 
 # ───────────────────────── 窗口操作（user32） ─────────────────────────
@@ -223,13 +245,20 @@ def refresh_amv(target: str, wait_seconds: int = 180, exe: Path | None = None) -
         pid = proc.pid
     start = time.time()
     opened = False
+    page_at = start
     if pid is not None:
         time.sleep(STARTUP_SETTLE)
+        page_at = time.time()
         opened = open_amv_page(pid)
     after = before
     while time.time() - start < wait_seconds:
-        after = latest_amv_date()
+        date, locked = read_amv_date()
+        after = max(after, date)
         if after >= target:
+            break
+        # 指南针占着文件读不了内容，但打开 0AMV 页面之后文件被写过，说明数据已经下来了：
+        # 不必空等到超时，退出指南针后再读确认
+        if locked and pid is not None and amv_file_mtime() >= page_at:
             break
         time.sleep(3)
     waited = int(time.time() - start)
@@ -237,6 +266,15 @@ def refresh_amv(target: str, wait_seconds: int = 180, exe: Path | None = None) -
     if pid is not None:
         time.sleep(3)  # 数据刚写完，留一点时间收尾
         closed = _close_gracefully(pid)
+    # 指南针退出后文件才放开：再读几次，以退出后读到的日期为准
+    for _ in range(10):
+        if after >= target:
+            break
+        date, locked = read_amv_date()
+        after = max(after, date)
+        if not locked:
+            break
+        time.sleep(1)
     error = ""
     if after < target:
         error = f"等了 {waited} 秒，活跃市值还停在 {after or '无数据'}"

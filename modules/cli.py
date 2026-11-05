@@ -256,6 +256,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_tqs.add_argument("--date", default="", help="交易日 YYYYMMDD；默认用通达信最新一根（盘中即当天实时）")
     p_tqs.add_argument("--boards", default="主板", help="板块，逗号分隔；all 表示不过滤")
 
+    # ── review：工作台选股页签过滤、Z哥诊断卡（只读）──
+    p_rev = subparsers.add_parser("review", help="按每日报告的规则复核几只股票：留下/剔除、原因、要点（JSON）")
+    p_rev.add_argument("--codes", required=True, help="股票代码，逗号分隔，如 600795.SH,002541")
+    p_rev.add_argument("--source", default="", help="选出它们的公式名，写进买入理由")
+    p_rev.add_argument("--date", default="", help="选股日 YYYYMMDD：本地数据早于它的标「待复核」，不参与剔除")
+
+    # ── forward-test：每日报告入选股的前向检验（对比同日随机基准，只读）──
+    p_fwd = subparsers.add_parser("forward-test", help="前向检验：入选后 5/10 日表现对比同日随机基准与上证（JSON）")
+    p_fwd.add_argument("--out", default="", help="报告目录（默认 .env 的 REPORT_OUT_DIR）")
+
     # ── amv-refresh ──
     p_amv = subparsers.add_parser("amv-refresh", help="打开指南针更新活跃市值（0AMV），更新完正常退出")
     p_amv.add_argument("--wait", type=int, default=180, help="最多等几秒")
@@ -453,6 +463,24 @@ def cmd_tq_select(args) -> None:
         tdx_tq.close()
 
 
+def cmd_review(args) -> None:
+    """按每日报告的规则复核几只股票，输出一行 JSON。"""
+    from .daily_selection_report import review_codes
+
+    date = args.date.strip() if len(args.date.strip()) == 8 and args.date.strip().isdigit() else ""
+    _print_json(review_codes([c for c in args.codes.split(",") if c.strip()], args.source.strip(), trade_date=date))
+
+
+def cmd_forward_test(args) -> None:
+    """前向检验，输出一行 JSON。"""
+    from pathlib import Path
+
+    from .forward_test import run_forward_test
+
+    out_dir = Path(args.out or os.environ.get("REPORT_OUT_DIR", "").strip() or "reports")
+    _print_json(run_forward_test(out_dir))
+
+
 def cmd_amv_refresh(args) -> None:
     """打开指南针更新活跃市值，打印更新前后的日期。"""
     from datetime import date
@@ -517,6 +545,8 @@ def main() -> None:
         "trade": cmd_trade,
         "daily": cmd_daily,
         "report": cmd_report,
+        "review": cmd_review,
+        "forward-test": cmd_forward_test,
         "amv-refresh": cmd_amv_refresh,
         "tq-formulas": cmd_tq_formulas,
         "tq-select": cmd_tq_select,

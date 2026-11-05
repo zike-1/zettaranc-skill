@@ -57,6 +57,25 @@ _DAY_DTYPE = np.dtype(
     ]
 )
 
+# 港股（2026-11-04，用户在通达信里同步了港股日线）：扩展行情 vipdoc/ds/lday/<市场号>#<代码>.day，
+# 每条 32 字节，价格是 float（不是 ×100 的整数），成交额 float，成交量单位手（100 股）。
+# 2026-11-04 核对 31#00700：收盘 401.6、成交量 185001 手 = 工作台显示的 1850.01 万股。
+# 本地没有港股除权记录，港股 K 线一律不复权。
+_DS_DAY_DTYPE = np.dtype(
+    [
+        ("date", "<u4"),
+        ("open", "<f4"),
+        ("high", "<f4"),
+        ("low", "<f4"),
+        ("close", "<f4"),
+        ("amount", "<f4"),
+        ("volume", "<u4"),
+        ("reserved", "<u4"),
+    ]
+)
+#: 港股在扩展行情里的市场号：31 主板、48 创业板
+_HK_MARKETS = ("31", "48")
+
 # (市场前缀, 代码前缀) → 板块。其余代码（指数、基金、债券等）不算 A 股个股。
 _BOARD_BY_PREFIX: dict[str, dict[tuple[str, ...], str]] = {
     "sh": {("600", "601", "603", "605"): "主板", ("688", "689"): "科创板"},
@@ -99,6 +118,8 @@ def board_of(symbol: str) -> str | None:
 def to_symbol(ts_code: str) -> str:
     """``600519.SH`` → ``sh600519``。没写交易所时按代码段推断，``600519`` 也能查到。"""
     code, _, exchange = ts_code.strip().partition(".")
+    if not exchange and len(code) == 5 and code.isdigit():
+        exchange = "hk"  # 5 位数字只可能是港股
     if not exchange:
         exchange = "sh" if code.startswith(("5", "6", "9")) and not code.startswith("92") else "bj" if code.startswith(("4", "8", "92")) else "sz"
     return f"{exchange.lower()}{code}"
@@ -122,11 +143,12 @@ def business_days_behind(trade_date: str, today: date | None = None) -> int:
 
 
 @functools.lru_cache(maxsize=2048)
-def _read_day_file(path: str, mtime_ns: int, size: int) -> np.ndarray:
-    """读取并校验一个 .day 文件，返回按日期升序的结构化数组。"""
-    if size % _DAY_DTYPE.itemsize:
+def _read_day_file(path: str, mtime_ns: int, size: int, hk: bool = False) -> np.ndarray:
+    """读取并校验一个 .day 文件，返回按日期升序的结构化数组。hk=True 按港股扩展行情（float 价格）读。"""
+    dtype = _DS_DAY_DTYPE if hk else _DAY_DTYPE
+    if size % dtype.itemsize:
         raise ValueError(f"{path} 长度 {size} 不是 32 的整数倍")
-    bars = np.fromfile(path, dtype=_DAY_DTYPE)
+    bars = np.fromfile(path, dtype=dtype)
     ok = (
         (bars["date"] >= 19900101)
         & (bars["date"] <= 21001231)
@@ -335,6 +357,20 @@ _ETF_PREFIXES = {"sh": ("51", "56", "58"), "sz": ("159",)}
 _ETF_SPLIT_JUMP = 0.25
 
 
+def is_hk(symbol: str) -> bool:
+    """``hk00700`` 这样的港股代码。"""
+    return symbol.startswith("hk")
+
+
+def decode_hk_bars(bars: np.ndarray) -> dict[str, np.ndarray]:
+    """港股扩展行情记录 → 自然单位：价格港元（float，保留 3 位）、成交量股、成交额港元。"""
+    out = {f: np.round(bars[f].astype(np.float64), 3) for f in ("open", "high", "low", "close")}
+    out["date"] = bars["date"].astype(np.int64)
+    out["amount_yuan"] = bars["amount"].astype(np.float64)
+    out["volume_shares"] = bars["volume"].astype(np.float64) * 100
+    return out
+
+
 def is_etf(symbol: str) -> bool:
     """``sh588200`` 这样的代码是否场内 ETF。"""
     return symbol[2:].startswith(_ETF_PREFIXES.get(symbol[:2], ()))
@@ -385,6 +421,13 @@ class TdxLocalClient:
     # ---------- 文件定位 ----------
 
     def _day_path(self, symbol: str) -> Path:
+        if is_hk(symbol):
+            folder = self.root / "vipdoc" / "ds" / "lday"
+            for market in _HK_MARKETS:
+                path = folder / f"{market}#{symbol[2:]}.day"
+                if path.exists():
+                    return path
+            return folder / f"{_HK_MARKETS[0]}#{symbol[2:]}.day"
         return self.root / "vipdoc" / symbol[:2] / "lday" / f"{symbol}.day"
 
     @property
@@ -395,10 +438,11 @@ class TdxLocalClient:
 
     def read_raw_bars(self, ts_code: str) -> np.ndarray | None:
         """读取未复权原始记录；文件不存在或损坏时返回 None。"""
-        path = self._day_path(to_symbol(ts_code))
+        symbol = to_symbol(ts_code)
+        path = self._day_path(symbol)
         try:
             stat = path.stat()
-            return _read_day_file(str(path), stat.st_mtime_ns, stat.st_size)
+            return _read_day_file(str(path), stat.st_mtime_ns, stat.st_size, is_hk(symbol))
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as e:
@@ -410,7 +454,8 @@ class TdxLocalClient:
         bars = self.read_raw_bars(ts_code)
         if bars is None or not len(bars):
             return None
-        series = decode_bars(bars, is_etf(to_symbol(ts_code)))
+        symbol = to_symbol(ts_code)
+        series = decode_hk_bars(bars) if is_hk(symbol) else decode_bars(bars, is_etf(symbol))
         return series if len(series["date"]) else None
 
     def _events(self) -> dict[str, np.ndarray]:
@@ -441,7 +486,7 @@ class TdxLocalClient:
         series = self.raw_series(ts_code)
         if series is None:
             return []
-        etf = is_etf(to_symbol(ts_code))
+        etf = is_etf(to_symbol(ts_code)) or is_hk(to_symbol(ts_code))  # 港股价格也保留 3 位小数
         dates = series["date"]
         raw = {f: series[f] for f in ("open", "high", "low", "close")}
         volume_shares = series["volume_shares"]
@@ -452,7 +497,8 @@ class TdxLocalClient:
             raw = {f: np.append(v, extra[f]) for f, v in raw.items()}
             volume_shares = np.append(volume_shares, extra["volume_shares"])
             amount_yuan = np.append(amount_yuan, extra["amount_yuan"])
-        if basis == "raw":
+        if basis == "raw" or is_hk(to_symbol(ts_code)):
+            # 港股没有除权记录、一律不复权：不去读 A 股的 gbbq（它缺失或损坏时港股也不该跟着失败）
             prices = raw
         else:
             events = self._events().get(to_symbol(ts_code))
@@ -484,7 +530,7 @@ class TdxLocalClient:
             }
             for i in range(len(dates))
         ]
-        shares = float_shares_on(dates, self._float_events(ts_code))
+        shares = None if is_hk(to_symbol(ts_code)) else float_shares_on(dates, self._float_events(ts_code))
         if shares is not None:
             # 手 / 万股 正好是百分比：手 × 100 股 ÷ (万股 × 10000 股) × 100%
             turnover = vols / shares

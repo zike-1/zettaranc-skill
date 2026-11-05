@@ -212,6 +212,30 @@ def test_selection_drops_st_sell_signals_flip_green_and_broken_yellow_line():
     assert selection_exclusion(**{**keep, "close": 8.5}) == "跌破黄线"
 
 
+def test_recent_brick_flip_follows_the_four_brick_text():
+    """近5日红砖翻绿不再一票否决：白线之上算洗盘；绿砖数满4块翻红且不创新低也留下；其余剔除"""
+    base = dict(name="某股", recent_sells=["四块砖翻绿"], brick_action="", red_bricks=1, macd_veto=False, close=10.0, yellow=9.0)
+    assert selection_exclusion(**base, white=9.8) == ""  # 白线之上：洗盘
+    assert selection_exclusion(**base, white=10.5, green_before=4) == ""  # 数满4块、不创新低
+    assert selection_exclusion(**base, white=10.5, green_before=4, new_low=True) == "绿砖数满4块翻红但创新低（白线下方）"
+    assert selection_exclusion(**base, white=10.5, green_before=2) == "近5日红砖翻绿，白线下方且绿砖未数满4块"
+    # 其他卖出信号照旧一票否决，且优先写出来
+    assert selection_exclusion(**{**base, "recent_sells": ["四块砖翻绿", "S2"]}, white=9.8) == "近5日S2"
+
+
+def test_green_before_red_counts_the_pullback():
+    from types import SimpleNamespace
+    from unittest import mock
+
+    rows = [{"low": low} for low in (10, 9.5, 9.4, 9.6, 9.7)]
+    with mock.patch("modules.indicators.price_patterns.brick.calculate_brick_series", return_value=[5, 6, 4, 3, 2, 2.5]):
+        assert dsr.green_before_red([SimpleNamespace()] * 6, rows) == (3, False)
+    with mock.patch("modules.indicators.price_patterns.brick.calculate_brick_series", return_value=[5, 6, 4, 3, 2, 2.5]):
+        assert dsr.green_before_red([SimpleNamespace()] * 6, rows[:-1] + [{"low": 9.0}]) == (3, True)
+    with mock.patch("modules.indicators.price_patterns.brick.calculate_brick_series", return_value=[5, 6, 7]):
+        assert dsr.green_before_red([SimpleNamespace()] * 3, rows) == (0, False)
+
+
 def test_latest_session_date_takes_newest_probe_quote():
     quotes = {
         "600519": {"quote_time": "20261231150003"},
@@ -292,3 +316,91 @@ def test_amv_refresh_waits_for_latest_session(tmp_path, monkeypatch, session, ex
     monkeypatch.setattr("modules.zhinanzhen_refresh.refresh_amv", fake_refresh)
     cmd_report(build_parser().parse_args(["report", "--refresh-amv", "--out", str(tmp_path)]))
     assert targets == [expected or f"{date.today():%Y-%m-%d}"]
+
+
+def test_review_codes_marks_kept_and_dropped_with_reasons(monkeypatch):
+    views = {
+        "600795": dsr.StockView(code="600795", name="国电电力", as_of="20261104", b1_today="B1", b1_text="B1买点 J=-3",
+                                brick_trend="RED", red_bricks=1, close=5.1, white=5.0, yellow=4.8, line="白线上方"),
+        "002541": dsr.StockView(code="002541", name="鸿路钢构", as_of="20261104", sells=["S1"], close=20, yellow=19),
+    }
+    monkeypatch.setattr(dsr, "analyze_view", lambda code, industry="": views[code[:6]])
+    monkeypatch.setattr(dsr, "prepare_today_overlay", lambda codes, now=None: dsr.OverlayResult(trade_date="20261104"))
+    monkeypatch.setattr(dsr, "amv_summary", lambda series_days=60: {"date": "2026-11-04", "state": "bull", "series": [1, 2]})
+    out = dsr.review_codes(["600795.SH", "002541.sz", "600795", "bad", "-x"], source="我的B1")
+    assert [i["code"] for i in out["items"]] == ["600795.SH", "002541.SZ"]
+    assert [i["status"] for i in out["items"]] == ["kept", "dropped"]
+    kept, dropped = out["items"]
+    assert kept["kept"] and kept["reasons"][0] == "我的B1选出" and "B1买点 J=-3" in kept["reasons"]
+    assert not dropped["kept"] and dropped["reason"] == "近5日S1" and dropped["reasons"] == []
+    assert out["amv"] == {"date": "2026-11-04", "state": "bull"} and out["overlay_date"] == "20261104"
+
+
+def test_review_command_prints_one_json_line(monkeypatch, capsys):
+    from modules.cli import build_parser, cmd_review
+
+    monkeypatch.setattr(dsr, "review_codes", lambda codes, source="", trade_date="": {"ok": True, "codes": codes, "source": source})
+    cmd_review(build_parser().parse_args(["review", "--codes", "600795.SH, 002541", "--source", "我的B1"]))
+    line = capsys.readouterr().out.strip()
+    assert json.loads(line) == {"ok": True, "codes": ["600795.SH", " 002541"], "source": "我的B1"}
+
+
+def test_review_codes_accepts_hong_kong_codes_as_reference(monkeypatch):
+    seen = []
+    monkeypatch.setattr(dsr, "analyze_view", lambda code, industry="": seen.append(code) or dsr.StockView(code=code, name=code, close=10, yellow=9))
+    monkeypatch.setattr(dsr, "prepare_today_overlay", lambda codes, now=None: seen.append(("overlay", list(codes))) or dsr.OverlayResult())
+    monkeypatch.setattr(dsr, "amv_summary", lambda series_days=60: None)
+    out = dsr.review_codes(["00700.HK", "600795.SH", "00700"])
+    assert [i["code"] for i in out["items"]] == ["00700.HK", "600795.SH"]
+    assert ("overlay", ["600795"]) in seen  # 港股不走 A 股行情补当天
+    hk, a = out["items"]
+    assert hk["market"] == "HK" and hk["notes"] and a["market"] == "A" and a["notes"] == []
+
+
+def test_skill_dsh_home_wins_over_a_system_dsh_home(monkeypatch, tmp_path):
+    """系统里给别的 DSH 用的 DSH_HOME 不能盖过技能自己的 ZT_DSH_HOME（2026-11-04 晚的定时任务读错了目录）"""
+    from modules.dsh_watchlist_sync import default_picks_file
+
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "other"))
+    monkeypatch.setenv("ZT_DSH_HOME", str(tmp_path / "mine"))
+    monkeypatch.delenv("DSH_WATCHLIST_FILE", raising=False)
+    monkeypatch.delenv("DSH_REPORT_PICKS_FILE", raising=False)
+    assert dsr.default_watch_files()[0] == tmp_path / "mine" / "watchlists.json"
+    assert default_picks_file() == tmp_path / "mine" / "report-picks.json"
+    monkeypatch.delenv("ZT_DSH_HOME")
+    assert default_picks_file() == tmp_path / "other" / "report-picks.json"
+
+
+def test_review_keeps_the_exchange_so_an_index_is_not_read_as_a_stock(monkeypatch):
+    """000001.SH 是上证指数：不能截成 000001 再推断成深市的平安银行，也不走按代码段取市场的行情补齐"""
+    seen = []
+    monkeypatch.setattr(dsr, "analyze_view", lambda code, industry="": seen.append(code) or dsr.StockView(code=code, name=code, close=10, yellow=9))
+    monkeypatch.setattr(dsr, "prepare_today_overlay", lambda codes, now=None: seen.append(("overlay", list(codes))) or dsr.OverlayResult())
+    monkeypatch.setattr(dsr, "amv_summary", lambda series_days=60: None)
+    out = dsr.review_codes(["000001.SH", "000001.SZ"])
+    assert [i["code"] for i in out["items"]] == ["000001.SH", "000001.SZ"]
+    assert "000001.SH" in seen and ("overlay", ["000001"]) in seen  # 只有能按代码段推断对的 000001.SZ 补当天
+
+
+def test_review_marks_stale_local_data_as_pending_not_dropped(monkeypatch):
+    """盘中通达信按当天选出、本地日线还在昨天：标待复核，不拿昨天的卖出信号剔除"""
+    monkeypatch.setattr(dsr, "analyze_view", lambda code, industry="": dsr.StockView(code=code, name="x", as_of="20261103", sells=["S1"], close=10, yellow=9))
+    monkeypatch.setattr(dsr, "prepare_today_overlay", lambda codes, now=None: dsr.OverlayResult())
+    monkeypatch.setattr(dsr, "amv_summary", lambda series_days=60: None)
+    item = dsr.review_codes(["600795.SH"], trade_date="20261104")["items"][0]
+    assert item["status"] == "stale" and not item["kept"] and "待复核" in item["reason"]
+    item = dsr.review_codes(["600795.SH"], trade_date="20261103")["items"][0]
+    assert item["status"] == "dropped" and item["reason"] == "近5日S1"
+
+
+def test_quote_bar_refuses_to_jump_over_missing_trading_days():
+    quote = {"quote_time": "20261104150003", "price": 10.8, "last_close": 10.4, "open": 10.5, "high": 10.9,
+             "low": 10.3, "volume_lots": 2000, "amount_wan": 216.0}
+    bar, reason = quote_to_bar(quote, 10.4, "20261028")
+    assert bar is None and "缺 4 个工作日" in reason
+
+
+def test_follow_up_ends_on_the_market_calendar_day_for_a_suspended_stock():
+    calendar = ["20261102", "20261103", "20261104", "20261105", "20261106", "20261109"]
+    rows = [{"trade_date": d, "close": c} for d, c in [("20261102", 10), ("20261103", 11), ("20261110", 15)]]  # 11-04 起停牌
+    assert follow_up_returns(rows, "20261102", (2, 5), calendar=calendar) == {2: 10.0, 5: 10.0}

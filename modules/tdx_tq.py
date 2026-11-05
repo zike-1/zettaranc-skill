@@ -141,20 +141,25 @@ def latest_date(result: dict) -> str:
 
 
 def drop_short_history(sel: TqSelection, bar_count, min_bars: int = MIN_BARS) -> TqSelection:
-    """剔除 K 线不足 min_bars 根的次新股；bar_count(600795.SH) 返回本地 K 线根数。"""
+    """剔除 K 线不足 min_bars 根的次新股；bar_count(600795.SH, 选股日) 返回到选股日为止的本地 K 线根数。"""
     keep = []
     for code in sel.picks:
-        (keep if bar_count(code) >= min_bars else sel.skipped_short).append(code)
+        (keep if bar_count(code, sel.trade_date) >= min_bars else sel.skipped_short).append(code)
     sel.picks = keep
     return sel
 
 
-def local_bar_count(code: str) -> int:
+def local_bar_count(code: str, trade_date: str = "") -> int:
+    """本地 K 线根数，只数日期不晚于 trade_date 的（补算历史日期时按当时的上市天数判断次新股）。"""
     from modules.tdx_local_client import TdxLocalClient, configured_root
 
     root = configured_root()
     series = TdxLocalClient(root).raw_series(code) if root else None
-    return len(series["date"]) if series is not None else 0
+    if series is None:
+        return 0
+    if trade_date:
+        return int((series["date"] <= int(trade_date)).sum())
+    return len(series["date"])
 
 
 def select(formula: str, trade_date: str | None = None, stock_list: list[str] | None = None, min_bars: int = MIN_BARS,

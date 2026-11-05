@@ -46,11 +46,16 @@ def default_tdx_dir() -> Path | None:
 
 
 def default_watch_files() -> tuple[Path | None, Path | None]:
-    """DSH 工作台自选文件：DSH_WATCHLIST_FILE，或 DSH_HOME 下的 watchlists.json；都没配置时不读自选。"""
+    """DSH 工作台自选文件：DSH_WATCHLIST_FILE，或工作台目录（ZT_DSH_HOME，其次 DSH_HOME）下的 watchlists.json。
+
+    ZT_DSH_HOME 优先：系统里常有给其他 DSH 安装用的 DSH_HOME 环境变量，它会盖过技能 .env 里的同名设置
+    （2026-11-04 晚的定时任务因此读错目录：持仓为空、选股名单没交给工作台）。都没配置时不读自选。
+    """
+    home = _env("ZT_DSH_HOME") or _env("DSH_HOME")
     if _env("DSH_WATCHLIST_FILE"):
         watch = Path(_env("DSH_WATCHLIST_FILE"))
-    elif _env("DSH_HOME"):
-        watch = Path(_env("DSH_HOME")) / "watchlists.json"
+    elif home:
+        watch = Path(home) / "watchlists.json"
     else:
         return None, None
     return watch, watch.with_name("watchlist-groups.json")
@@ -79,6 +84,8 @@ DIVIDEND_INDUSTRIES = {"T0102": "电力", "T1001": "银行", "T1003": "保险"}
 SELL_LOOKBACK = 5
 BUY_STRATEGIES = {"B1", "SB1", "超级B1"}
 SELL_STRATEGIES = {"S1", "S2", "S3", "四块砖翻绿"}
+#: 技能里「四块砖翻绿」是任何一次红砖转绿（持仓止损信号），选股时不一票否决，见 selection_exclusion
+BRICK_FLIP = "四块砖翻绿"
 #: 中阳 / 大阳放飞门槛（knowledge/trading-core.md：4% 中阳、7% 大阳）
 MID_YANG_PCT = 4.0
 BIG_YANG_PCT = 7.0
@@ -325,6 +332,13 @@ def quote_to_bar(quote: dict, local_close: float, local_date: str) -> tuple[dict
         return None, "行情没有时间"
     if when <= local_date:
         return None, ""  # 本地已有当天
+    # 只补紧挨着本地最后一根的那一天：中间缺了交易日硬接上去，均线和「近 5 日」信号都会算错。
+    # 没有节假日表，按工作日数：节后第一天本地还没下载时也会跳过，报告里写明原因，宁缺勿错。
+    from modules.tdx_local_client import business_days_behind
+
+    gap = business_days_behind(local_date, datetime.strptime(when, "%Y%m%d").date())
+    if gap > 1:
+        return None, f"本地日线停在 {local_date}，中间缺 {gap - 1} 个工作日，先在通达信下载盘后数据"
     if not quote.get("price") or not quote.get("volume_lots"):
         return None, "停牌或无成交"
     if abs(float(quote["last_close"]) - local_close) > 0.011:
@@ -481,16 +495,50 @@ def line_position(close: float, white: float, yellow: float) -> str:
     return "跌破黄线"
 
 
-def selection_exclusion(name: str, recent_sells: list[str], brick_action: str, red_bricks: int, macd_veto: bool, close: float, yellow: float) -> str:
-    """选股结果剔除原因；空串 = 保留。活跃市值不在这里，它只作背景。"""
+def green_before_red(daily: list, rows: list[dict]) -> tuple[int, bool]:
+    """今天是红砖时，之前连着几块绿砖，以及今天最低价是否低于这段绿砖的最低价。今天不是红砖 → (0, False)。
+
+    砖色口径同 detect_four_brick_system：今日砖值 >= 昨日为红。
+    """
+    from modules.indicators.price_patterns.brick import calculate_brick_series
+
+    bricks = calculate_brick_series(daily)
+    if len(bricks) < 3 or bricks[-1] < bricks[-2]:
+        return 0, False
+    green = 0
+    i = len(bricks) - 2
+    while i >= 1 and bricks[i] < bricks[i - 1]:
+        green += 1
+        i -= 1
+    if green == 0:
+        return 0, False
+    green_lows = [float(r["low"]) for r in rows[-(green + 1):-1]]
+    return green, bool(green_lows) and float(rows[-1]["low"]) < min(green_lows)
+
+
+def selection_exclusion(name: str, recent_sells: list[str], brick_action: str, red_bricks: int, macd_veto: bool, close: float, yellow: float,
+                        white: float = 0, green_before: int = 0, new_low: bool = False) -> str:
+    """选股结果剔除原因；空串 = 保留。活跃市值不在这里，它只作背景。
+
+    近 5 日的「四块砖翻绿」（任何一次红砖转绿）不一票否决，按四块砖原文判断（knowledge/trading-core.md 3.2、
+    brick-moving.md）：白线之上的绿砖看作洗盘；绿砖数满 4 块、翻红且不创新低才试错。两条都不满足才剔除。
+    """
     if "ST" in name.upper():
         return "ST"
-    if recent_sells:
-        return f"近{SELL_LOOKBACK}日{recent_sells[0]}"
+    other_sells = [sell for sell in recent_sells if sell != BRICK_FLIP]
+    if other_sells:
+        return f"近{SELL_LOOKBACK}日{other_sells[0]}"
     if brick_action == "止损":
         return "红砖翻绿"
     if red_bricks >= 4:
         return f"已第{red_bricks}块红砖"
+    if BRICK_FLIP in recent_sells:
+        above_white = white > 0 and close >= white
+        counted = green_before >= 4 and not new_low
+        if not (above_white or counted):
+            if green_before >= 4:
+                return "绿砖数满4块翻红但创新低（白线下方）"
+            return f"近{SELL_LOOKBACK}日红砖翻绿，白线下方且绿砖未数满4块"
     if macd_veto:
         return "MACD一票否决"
     if yellow > 0 and close < yellow:
@@ -498,8 +546,14 @@ def selection_exclusion(name: str, recent_sells: list[str], brick_action: str, r
     return ""
 
 
-def follow_up_returns(rows: list[dict], pick_date: str, horizons: tuple[int, ...] = FOLLOW_UP_DAYS) -> dict[int, float | None]:
-    """入选日收盘买入，第 N 个交易日收盘的涨跌幅（%）；还没走到那天的为 None。rows 用等比复权口径。"""
+def follow_up_returns(
+    rows: list[dict], pick_date: str, horizons: tuple[int, ...] = FOLLOW_UP_DAYS, calendar: list[str] | None = None
+) -> dict[int, float | None]:
+    """入选日收盘买入，第 N 个交易日收盘的涨跌幅（%）；还没走到那天的为 None。rows 用等比复权口径。
+
+    calendar（市场交易日，通常取上证指数日线）给了时，第 N 天按市场日历数，停牌的股票取那天之前最后一根
+    收盘（停牌估值），所有股票、指数的结束日一致；不给时按这只股票自己的第 N 根 K 线（旧口径，测试用）。
+    """
     dates = [str(r["trade_date"]) for r in rows]
     if pick_date not in dates:
         return dict.fromkeys(horizons)
@@ -507,7 +561,18 @@ def follow_up_returns(rows: list[dict], pick_date: str, horizons: tuple[int, ...
     base = float(rows[i]["close"])
     out: dict[int, float | None] = {}
     for n in horizons:
-        out[n] = round((float(rows[i + n]["close"]) / base - 1) * 100, 2) if i + n < len(rows) and base else None
+        if not base:
+            out[n] = None
+            continue
+        if calendar is None:
+            out[n] = round((float(rows[i + n]["close"]) / base - 1) * 100, 2) if i + n < len(rows) else None
+            continue
+        if pick_date not in calendar or calendar.index(pick_date) + n >= len(calendar):
+            out[n] = None
+            continue
+        end = calendar[calendar.index(pick_date) + n]
+        j = max(k for k in range(i, len(dates)) if dates[k] <= end)
+        out[n] = round((float(rows[j]["close"]) / base - 1) * 100, 2)
     return out
 
 
@@ -541,6 +606,10 @@ class StockView:
     white: float = 0
     yellow: float = 0
     line: str = ""
+    #: 今天红砖时，之前连着几块绿砖（回调后翻红）；今天不是红砖 = 0
+    green_before: int = 0
+    #: 今天的最低价低于这段绿砖的最低价（翻红但创新低）
+    new_low: bool = False
 
 
 def analyze_view(code: str, industry: str = "") -> StockView:
@@ -586,6 +655,7 @@ def analyze_view(code: str, industry: str = "") -> StockView:
     view.brick_action = brick_state.get("brick_action", "")
     if brick_state.get("is_brick_flip_green"):
         view.brick = "红砖翻绿"
+    view.green_before, view.new_low = green_before_red(daily[-ANALYZE_DAYS:], rows)
 
     trade_dates = [str(r["trade_date"]) for r in rows]
     recent_dates = set(trade_dates[-SELL_LOOKBACK:])
@@ -625,7 +695,9 @@ def buy_reasons(view: StockView, sources: list[str]) -> list[str]:
         reasons.append(view.b1_text)
     elif view.b1_today:
         reasons.append(f"今日{view.b1_today}")
-    if view.brick_trend == "RED" and view.red_bricks:
+    if view.green_before:
+        reasons.append(f"回调{view.green_before}块绿砖后翻红")
+    elif view.brick_trend == "RED" and view.red_bricks:
         reasons.append(f"第{view.red_bricks}块红砖")
     if view.line in ("白线上方", "白黄之间"):
         reasons.append("回踩白黄之间" if view.line == "白黄之间" else view.line)
@@ -737,6 +809,7 @@ def follow_up_section(history: list[dict]) -> dict:
             rows_cache[key] = local_kline_rows(code, days=0, basis=basis) or []
         return rows_cache[key]
 
+    calendar = [str(r["trade_date"]) for r in rows_of("000001.SH", "raw")] or None
     entries: list[dict] = []
     # 同一个数据日期只算一次：休市日、补跑会多出文件名不同、内容相同的报告，以后生成的为准
     latest: dict[str, dict] = {}
@@ -744,9 +817,9 @@ def follow_up_section(history: list[dict]) -> dict:
         latest[report.get("data_date") or report.get("date", "")] = report
     for report in latest.values():
         pick_date = report.get("data_date", "")
-        bench = follow_up_returns(rows_of("000001.SH", "raw"), pick_date)
+        bench = follow_up_returns(rows_of("000001.SH", "raw"), pick_date, calendar=calendar)
         for pick in report.get("picks", []):
-            returns = follow_up_returns(rows_of(pick["code"]), pick_date)
+            returns = follow_up_returns(rows_of(pick["code"]), pick_date, calendar=calendar)
             entries.append({
                 "date": pick_date,
                 "code": pick["code"],
@@ -829,6 +902,78 @@ def _view_dict(view: StockView) -> dict:
     return asdict(view)
 
 
+# ───────────────────────── 工作台复核 ─────────────────────────
+
+#: 复核一次最多看几只（每只约半秒）
+REVIEW_LIMIT = 120
+_CODE_RE = re.compile(r"(\d{6})(\.(SH|SZ|BJ))?|(\d{5})\.HK")
+#: 港股复核只作参考：写进每只的 notes
+HK_NOTES = [
+    "港股仅作参考：选股与卖出规则按 A 股框架和参数，未在港股上验证",
+    "本地没有港股除权记录，港股 K 线未复权，除权除息日附近的指标会失真",
+    "活跃市值是 A 股指标，对港股只作背景",
+]
+
+
+def review_codes(codes: list[str], source: str = "", now: datetime | None = None, trade_date: str = "") -> dict:
+    """工作台用：按每日报告同一套规则复核几只股票（选股页签的过滤、Z哥诊断卡）。
+
+    每只给出 status（kept 留下 / dropped 剔除 / stale 待复核）、剔除原因或买入理由，以及砖块、B1、卖出信号
+    等要点。代码原样保留交易所（000001.SH 是上证指数，不能截成 000001 再按代码段推断成平安银行）。
+    trade_date（选股日）给了时，本地数据早于它的标 stale：盘中通达信按当天实时数据选出，本地日线还停在昨天，
+    不能拿昨天的卖出信号剔除今天才出现的信号。收盘后本地缺当天 K 线时用实时行情补一根，和报告口径一致。
+    只读，不写任何文件；活跃市值只作背景。
+    """
+    from modules.tdx_local_client import clear_today_overlay, to_symbol
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for raw in codes:
+        match = _CODE_RE.fullmatch(raw.strip().upper())
+        if not match:
+            continue
+        code = f"{match.group(4)}.HK" if match.group(4) else f"{match.group(1)}{match.group(2) or ''}"
+        if to_symbol(code) not in seen:
+            seen.add(to_symbol(code))
+            targets.append(code)
+    targets = targets[:REVIEW_LIMIT]
+    # 收盘后补当天 K 线只对 A 股，且只对按代码段推断得出同一交易所的（行情接口按代码段取市场，
+    # 000001.SH 上证指数会被取成深市的 000001）；港股读本地同步的日线
+    overlay_codes = [c.split(".")[0] for c in targets if not c.endswith(".HK") and to_symbol(c) == to_symbol(c.split(".")[0])]
+    overlay = prepare_today_overlay(overlay_codes, now) if overlay_codes else OverlayResult()
+    items = []
+    try:
+        for code in targets:
+            view = analyze_view(code)
+            hk = code.endswith(".HK")
+            stale = bool(trade_date) and not view.error and bool(view.as_of) and view.as_of < trade_date
+            if stale:
+                status, reason = "stale", f"本地数据截至 {view.as_of}，早于选股日 {trade_date}，待复核"
+            else:
+                reason = f"无法分析：{view.error}" if view.error else selection_exclusion(
+                    view.name, view.sells, view.brick_action, view.red_bricks, view.macd_veto, view.close, view.yellow,
+                    white=view.white, green_before=view.green_before, new_low=view.new_low,
+                )
+                status = "dropped" if reason else "kept"
+            items.append({
+                "code": code,
+                "name": view.name,
+                "market": "HK" if hk else "A",
+                "status": status,
+                "kept": status == "kept",
+                "reason": reason,
+                "reasons": buy_reasons(view, [source] if source else []) if status == "kept" else [],
+                "view": _view_dict(view),
+                "notes": HK_NOTES if hk else [],
+            })
+    finally:
+        clear_today_overlay()
+    amv = amv_summary()
+    if amv is not None:
+        amv = {key: value for key, value in amv.items() if key != "series"}
+    return {"ok": True, "items": items, "amv": amv, "overlay_date": overlay.trade_date}
+
+
 def collect_report(
     tdx_dir: Path | None = None,
     watch_file: Path | None = None,
@@ -898,7 +1043,8 @@ def collect_report(
         for code, names in sources.items():
             v = view_of(code)
             reason = f"无法分析：{v.error}" if v.error else selection_exclusion(
-                v.name, v.sells, v.brick_action, v.red_bricks, v.macd_veto, v.close, v.yellow
+                v.name, v.sells, v.brick_action, v.red_bricks, v.macd_veto, v.close, v.yellow,
+                white=v.white, green_before=v.green_before, new_low=v.new_low,
             )
             if reason:
                 dropped.append({"code": code, "name": v.name, "sources": names, "reason": reason})
@@ -954,7 +1100,8 @@ def collect_report(
         "dividend": dividend_section,
         "follow_up": follow_up,
         "rules": {
-            "exclude": f"近{SELL_LOOKBACK}日 S1/S2/S3/四块砖翻绿、今日红砖翻绿、第4块红砖及以后、MACD一票否决、跌破黄线、ST",
+            "exclude": (f"近{SELL_LOOKBACK}日 S1/S2/S3、近{SELL_LOOKBACK}日红砖翻绿且不在白线之上（绿砖数满4块翻红且不创新低的除外）、"
+                        "今日红砖翻绿、第4块红砖及以后、MACD一票否决、跌破黄线、ST"),
             "add": "持仓加仓只看 B1：今日有 B1 类买点即可加仓，连续几天一并标出",
             "amv": "活跃市值只作背景，不否决选股和加仓",
         },

@@ -31,7 +31,7 @@ def test_latest_date_is_the_newest_last_bar():
 def test_new_listings_without_enough_history_are_dropped():
     sel = TqSelection(formula="X", trade_date="20261103", picks=["002181.SZ", "603468.SH"])
     counts = {"002181.SZ": 1272, "603468.SH": 58}
-    out = drop_short_history(sel, counts.get, min_bars=120)
+    out = drop_short_history(sel, lambda code, day: counts.get(code, 0), min_bars=120)
     assert out.picks == ["002181.SZ"] and out.skipped_short == ["603468.SH"]
 
 
@@ -40,3 +40,19 @@ def test_tdx_engine_only_for_today_after_close():
     assert tq_usable_for("20261104", datetime(2026, 11, 4, 20, 0))
     assert not tq_usable_for("20261104", datetime(2026, 11, 4, 10, 30))
     assert not tq_usable_for("20261103", datetime(2026, 11, 4, 20, 0))
+
+
+def test_local_bar_count_only_counts_bars_up_to_the_trade_date(monkeypatch):
+    import numpy as np
+
+    import modules.tdx_local_client as tlc
+    from modules.tdx_tq import local_bar_count
+
+    class Client:
+        def __init__(self, root): pass
+        def raw_series(self, code): return {"date": np.array([20261030, 20261102, 20261103, 20261104])}
+
+    monkeypatch.setattr(tlc, "configured_root", lambda: "x")
+    monkeypatch.setattr(tlc, "TdxLocalClient", Client)
+    assert local_bar_count("600795.SH", "20261102") == 2
+    assert local_bar_count("600795.SH") == 4
