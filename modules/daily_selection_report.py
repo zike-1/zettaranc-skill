@@ -10,7 +10,7 @@
 4. 红利组：通达信行业 电力(T0102) / 银行(T1001) / 保险(T1003)，只列今日 B1；
 5. 历史入选表现：之前入选的票 5 / 10 个交易日后的涨跌，对比上证指数。
 
-本地通达信还没下载当天数据时，用腾讯实时行情补当天一根（见 ``prepare_today_overlay``）。
+本地通达信还没下载当天数据时，用实时行情补当天一根：通达信 TQ 优先，其次腾讯 / 同花顺 / 东财（见 ``prepare_today_overlay``）。
 数据只读：通达信目录（blocknew、hq_cache）和 DSH 自选文件都不写。
 判断规则全部来自技能已有信号和知识库（放飞见 knowledge/trading-core.md 第 7 层），不是投资建议。
 """
@@ -259,19 +259,25 @@ class OverlayResult:
     applied: int = 0
     skipped: list[tuple[str, str]] = field(default_factory=list)
     error: str = ""
-    #: 每个来源补上了几只，如 {"腾讯": 3, "东财": 1}
+    #: 每个来源补上了几只，如 {"通达信": 3, "腾讯": 1}
     sources: dict[str, int] = field(default_factory=dict)
 
 
 def quote_sources() -> list[tuple[str, object]]:
-    """补当天 K 线的行情来源，按顺序尝试：腾讯 → 同花顺（配置了 Key 才用）→ 东财。
+    """补当天 K 线的行情来源，按顺序尝试：通达信 TQ（通达信开着时）→ 腾讯 → 同花顺（配置了 Key 才用）→ 东财。
 
-    每个来源是 ``fetch(codes) -> {6 位代码: 行情 dict}``，字段口径同 tencent_quote。
+    每个来源是 ``fetch(codes) -> {6 位代码: 行情 dict}``，字段口径同 tencent_quote。上一个来源失败或没给的票
+    交给下一个。通达信优先：数据和本地 .day 同源，2026-11-05 实测逐项一致。
     """
     from modules.a_stock_data_client import eastmoney_quote, tencent_quote
     from modules.hithink_client import HithinkFinanceClient
+    from modules.tdx_tq import tdx_running, tq_dir, tq_quote
 
-    sources: list[tuple[str, object]] = [("腾讯", tencent_quote)]
+    sources: list[tuple[str, object]] = []
+    tq_path = tq_dir()
+    if tq_path is not None and (tq_path / "tqcenter.py").is_file() and tdx_running():
+        sources.append(("通达信", tq_quote))
+    sources.append(("腾讯", tencent_quote))
     hithink = HithinkFinanceClient()
     if hithink.is_configured:
         sources.append(("同花顺", hithink.quote_bars))
@@ -311,7 +317,7 @@ def fill_today_bars(
                     result.trade_date = max(result.trade_date, bar["trade_date"])
                 elif reason:
                     result.skipped.append((code, f"{reason}（{name}）"))
-            if start + QUOTE_BATCH < len(pending):
+            if start + QUOTE_BATCH < len(pending) and not getattr(fetch, "local", False):
                 time.sleep(pause)
         pending = missing
     result.skipped.extend((code, "各行情来源都没有") for code in pending)
@@ -322,7 +328,7 @@ def fill_today_bars(
 
 
 def quote_to_bar(quote: dict, local_close: float, local_date: str) -> tuple[dict | None, str]:
-    """实时行情（腾讯 / 同花顺 / 东财，同一口径）→ 当天未复权 K 线。返回 (bar, 跳过原因)。
+    """实时行情（通达信 TQ / 腾讯 / 同花顺 / 东财，同一口径）→ 当天未复权 K 线。返回 (bar, 跳过原因)。
 
     昨收和本地最后一根收盘对不上时跳过：多半是今天除权除息，本地除权文件还没有这条记录，
     硬拼会让复权口径错位。
@@ -371,7 +377,15 @@ def prepare_today_overlay(codes: list[str], now: datetime | None = None) -> Over
         series = client.raw_series(code)  # ETF 价格按 ×1000 解码，和个股一样换成元
         if series is not None:
             local[code] = (float(series["close"][-1]), str(int(series["date"][-1])))
-    overlay, result = fill_today_bars(local, quote_sources())
+    sources = quote_sources()
+    try:
+        overlay, result = fill_today_bars(local, sources)
+    finally:
+        if any(name == "通达信" for name, _ in sources):
+            # 主动关掉 TQ 连接：tqcenter 退出时的清理会往 stdout 打印「TQ数据连接已关闭」，弄脏命令行的 JSON 输出
+            from modules import tdx_tq
+
+            tdx_tq.close()
     # 补算历史日期时（now 是过去的某天），行情接口给的是「现在」的行情：比报告日期新的不要
     limit = now.strftime("%Y%m%d")
     late = [code for code, bar in overlay.items() if bar["trade_date"] > limit]
@@ -721,7 +735,14 @@ def amv_summary(series_days: int = AMV_SERIES_DAYS) -> dict | None:
     last = states[-1]
     trig = next_day_triggers(last)
     days_in_state = sum(1 for s in states if s.since == last.since and s.state == last.state)
-    closes = {p.date: p.close for p in points}
+    by_date = {p.date: p for p in points}
+
+    def bar(s) -> dict:
+        # 开高低收都给（2026-11-05：日报和工作台画 K 线）；旧报告只有 close，前端退回折线
+        p = by_date.get(s.date)
+        if p is None:
+            return {"date": s.date, "close": 0, "state": s.state}
+        return {"date": s.date, "open": p.open, "high": p.high, "low": p.low, "close": p.close, "state": s.state}
     return {
         "date": last.date,
         "state": last.state,
@@ -730,7 +751,7 @@ def amv_summary(series_days: int = AMV_SERIES_DAYS) -> dict | None:
         "pct_chg": last.pct_chg,
         "bull_at": trig["next_day_bull_at"],
         "bear_at": trig["next_day_bear_at"],
-        "series": [{"date": s.date, "close": closes.get(s.date, 0), "state": s.state} for s in states[-series_days:]],
+        "series": [bar(s) for s in states[-series_days:]],
     }
 
 

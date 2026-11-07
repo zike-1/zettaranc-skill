@@ -56,3 +56,67 @@ def test_local_bar_count_only_counts_bars_up_to_the_trade_date(monkeypatch):
     monkeypatch.setattr(tlc, "TdxLocalClient", Client)
     assert local_bar_count("600795.SH", "20261102") == 2
     assert local_bar_count("600795.SH") == 4
+
+
+class _FakeTq:
+    """get_market_data 的替身：按 dividend_type 返回不复权 / 前复权两张表。"""
+
+    def __init__(self, frames):
+        self.frames = frames
+
+    def get_market_data(self, field_list, stock_list, period, count, dividend_type):
+        return self.frames[dividend_type]
+
+
+def _frames(dates, raw_close, front_close, code="601988.SH"):
+    import pandas as pd
+
+    idx = pd.to_datetime(dates)
+    col = lambda values: pd.DataFrame({code: values}, index=idx)  # noqa: E731
+    raw = {f: col([1.0] * len(dates)) for f in ("Open", "High", "Low")}
+    raw.update(Close=col(raw_close), Volume=col([325202688.0, 353461376.0]), Amount=col([221933.42, 237740.03]))
+    return {"none": raw, "front": {"Close": col(front_close)}}
+
+
+def test_tq_quote_gives_today_bar_in_tencent_units(monkeypatch):
+    import modules.tdx_tq as tdx_tq
+
+    fake = _FakeTq(_frames(["2026-11-04", "2026-11-05"], [6.83, 6.77], [6.83, 6.77]))
+    monkeypatch.setattr(tdx_tq, "_client", lambda: fake)
+    out = tdx_tq.tq_quote(["601988"], today="20261105")
+    bar = out["601988"]
+    assert bar["price"] == 6.77 and bar["last_close"] == 6.83
+    assert bar["volume_lots"] == 3534613.76 and bar["amount_wan"] == 237740.03
+    assert bar["quote_time"].startswith("20261105")
+
+
+def test_tq_quote_leaves_stale_and_ex_dividend_days_to_other_sources(monkeypatch):
+    import modules.tdx_tq as tdx_tq
+
+    stale = _FakeTq(_frames(["2026-11-03", "2026-11-04"], [6.92, 6.83], [6.92, 6.83]))
+    monkeypatch.setattr(tdx_tq, "_client", lambda: stale)
+    assert tdx_tq.tq_quote(["601988"], today="20261105") == {}
+    # 今天除权：前复权的昨收比不复权的低
+    exdiv = _FakeTq(_frames(["2026-11-04", "2026-11-05"], [6.83, 6.60], [6.60, 6.60]))
+    monkeypatch.setattr(tdx_tq, "_client", lambda: exdiv)
+    assert tdx_tq.tq_quote(["601988"], today="20261105") == {}
+
+
+def test_tq_unavailable_becomes_oserror_so_next_source_is_tried(monkeypatch):
+    import pytest
+
+    import modules.tdx_tq as tdx_tq
+    from modules.daily_selection_report import fill_today_bars
+
+    def boom():
+        raise tdx_tq.TqUnavailable("通达信没有运行")
+
+    monkeypatch.setattr(tdx_tq, "_client", boom)
+    with pytest.raises(OSError):
+        tdx_tq.tq_quote(["601988"], today="20261105")
+    backup = {"601988": {"quote_time": "20261105150000", "price": 6.77, "last_close": 6.83, "open": 6.79,
+                         "high": 6.81, "low": 6.66, "volume_lots": 3534614, "amount_wan": 237740}}
+    overlay, result = fill_today_bars({"601988": (6.83, "20261104")},
+                                      [("通达信", tdx_tq.tq_quote), ("腾讯", lambda codes: backup)], pause=0)
+    assert overlay["601988"]["close"] == 6.77
+    assert result.sources == {"腾讯": 1} and "通达信" in result.error

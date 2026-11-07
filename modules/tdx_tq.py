@@ -82,6 +82,80 @@ def close() -> None:
         _tq = None
 
 
+def tq_quote(codes: list[str], today: str | None = None) -> dict[str, dict]:
+    """通达信 TQ 取当天日线，口径同 ``a_stock_data_client.tencent_quote``：``{6 位代码: {price, last_close, open,
+    high, low, volume_lots, amount_wan, quote_time}}``，给每日报告 / Z哥诊断补「本地还没下载的当天 K 线」。
+
+    - 用 ``get_market_data``（不复权日线，取最后两根）：开高低收单位元，Volume 单位股，Amount 单位万元。
+      2026-11-05 实测 601988 / 510300 / 000001 / 300750：11-04 那根和本地 .day 文件逐项一致；
+    - 只返回最后一根就是 ``today`` 的票（通达信没连上行情时最后一根停在昨天，留给下一个来源）；
+    - 今天除权除息的（前复权和不复权的昨收对不上）不返回：TQ 的「昨收」是不复权的旧价，核对不出除权，
+      交给腾讯等来源用交易所给的昨收核对；
+    - ``refresh_kline`` 实测只刷新通达信的内存缓存，不写 vipdoc，这里不调用；本函数也不写任何文件。
+
+    通达信没开、接口失败时抛 OSError（调用方据此换下一个来源）。
+    """
+    from datetime import datetime
+
+    from modules.tdx_local_client import to_symbol, to_ts_code
+
+    today = today or datetime.now().strftime("%Y%m%d")
+    wanted = {to_ts_code(to_symbol(code)): code for code in codes}
+    if not wanted:
+        return {}
+    try:
+        with _lock:
+            tq = _client()
+            with contextlib.redirect_stdout(sys.stderr):
+                raw = tq.get_market_data(
+                    field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+                    stock_list=list(wanted), period="1d", count=2, dividend_type="none",
+                )
+                front = tq.get_market_data(field_list=["Close"], stock_list=list(wanted), period="1d", count=2,
+                                           dividend_type="front")
+    except TqUnavailable as e:
+        raise OSError(str(e)) from e
+    except Exception as e:  # noqa: BLE001 — DLL / 连接异常一律当作这个来源不可用
+        raise OSError(f"TQ 取行情失败：{e}") from e
+    if not isinstance(raw, dict) or "Close" not in raw:
+        raise OSError("TQ 没有返回日线")
+    out: dict[str, dict] = {}
+    closes = raw["Close"]
+    for ts_code, code in wanted.items():
+        if ts_code not in closes.columns:
+            continue
+        col = closes[ts_code].dropna()
+        if len(col) < 2:
+            continue
+        when = col.index[-1]
+        when = when.strftime("%Y%m%d") if hasattr(when, "strftime") else str(when).replace("-", "")[:8]
+        if when != today:
+            continue
+        prev_raw = float(col.iloc[-2])
+        try:
+            prev_front = float(front["Close"][ts_code].dropna().iloc[-2])
+        except (KeyError, IndexError, TypeError):
+            continue  # 核对不了除权就不用这个来源
+        if abs(prev_front - prev_raw) > 1e-6:
+            continue  # 今天除权除息
+        row = {f: float(raw[f][ts_code].iloc[-1]) for f in ("Open", "High", "Low", "Close", "Volume", "Amount")}
+        out[code] = {
+            "price": row["Close"],
+            "last_close": prev_raw,
+            "open": row["Open"],
+            "high": row["High"],
+            "low": row["Low"],
+            "volume_lots": row["Volume"] / 100,
+            "amount_wan": row["Amount"],
+            "quote_time": f"{today}150000",
+        }
+    return out
+
+
+#: fill_today_bars 看到这个标记就不在批次之间停顿（本机接口，不怕限流）
+tq_quote.local = True  # type: ignore[attr-defined]
+
+
 def list_formulas(include_system: bool = False) -> list[dict]:
     """通达信里的条件选股公式：[{code, name, system}]。默认只列用户自己的。"""
     with _lock:

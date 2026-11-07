@@ -1,6 +1,6 @@
 @echo off
 rem 每日选股报告：先打开指南针更新活跃市值，再生成 HTML 报告并交给 DSH 工作台。
-rem 给 Windows 任务计划在工作日收盘后调用（例如 20:00），也可以双击手动跑。
+rem 给 Windows 任务计划在工作日收盘后调用（例如 17:00），也可以双击手动跑。
 rem 休市日（或还没开盘）且最近一个交易日的报告已生成时直接跳过，不打开指南针。
 rem 日志目录：.env 里 REPORT_OUT_DIR 下的 logs；没配置时用技能目录下的 data\logs。
 setlocal

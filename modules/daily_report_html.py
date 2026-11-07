@@ -45,6 +45,7 @@ h2 .count{font-size:13px;color:var(--muted);font-weight:400}
 .amv .meta{margin-top:8px;color:var(--muted);font-size:13px}
 .amv .next{font-size:14px;margin-bottom:6px}
 .amv svg{width:100%;height:84px;display:block}
+.amv svg.kline{height:150px;border-radius:6px}
 .up{color:var(--up)}.down{color:var(--down)}.muted{color:var(--muted)}
 .stock-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .stock-name{font-weight:650;font-size:16px}
@@ -112,6 +113,48 @@ def _ymd(text: str) -> str:
 # ───────────────────────── 组件 ─────────────────────────
 
 
+def _amv_kline(series: list[dict]) -> str:
+    """活跃市值日 K 线（2026-11-05）：红涨绿跌的蜡烛，背景按当天多空状态铺浅红 / 浅绿。
+
+    旧报告的 series 只有收盘价，退回折线（_sparkline）。
+    """
+    points = [p for p in series if p.get("close") and all(p.get(k) for k in ("open", "high", "low"))]
+    if len(points) < 2 or len(points) < len([p for p in series if p.get("close")]):
+        return _sparkline(series)
+    width, height, pad_x, pad_y = 600, 150, 4, 8
+    lo = min(p["low"] for p in points)
+    hi = max(p["high"] for p in points)
+    span = hi - lo or 1
+    step = (width - pad_x * 2) / len(points)
+    body = max(1.0, step * 0.62)
+
+    def y(v: float) -> float:
+        return pad_y + (hi - v) / span * (height - pad_y * 2)
+
+    bands, candles = [], []
+    for i, p in enumerate(points):
+        x0 = pad_x + i * step
+        cx = x0 + step / 2
+        bg = {"BULL": "var(--up-bg)", "BEAR": "var(--down-bg)"}.get(p.get("state", ""), "")
+        if bg:
+            bands.append(f'<rect x="{x0:.1f}" y="0" width="{step + 0.3:.1f}" height="{height}" fill="{bg}"/>')
+        up = p["close"] >= p["open"]
+        color = "var(--up)" if up else "var(--down)"
+        top, bottom = y(max(p["open"], p["close"])), y(min(p["open"], p["close"]))
+        candles.append(
+            f'<line x1="{cx:.1f}" y1="{y(p["high"]):.1f}" x2="{cx:.1f}" y2="{y(p["low"]):.1f}" stroke="{color}" stroke-width="1"/>'
+            f'<rect x="{cx - body / 2:.1f}" y="{top:.1f}" width="{body:.1f}" height="{max(1.0, bottom - top):.1f}" fill="{color}"/>'
+        )
+    first, last = _date_cn(points[0]["date"]).split(" ")[0], _date_cn(points[-1]["date"]).split(" ")[0]
+    return (
+        f'<svg class="kline" viewBox="0 0 {width} {height}" preserveAspectRatio="none" role="img" '
+        f'aria-label="活跃市值近{len(points)}个交易日日K线，背景红色为多头区间，绿色为空头区间">'
+        + "".join(bands) + "".join(candles) + "</svg>"
+        f'<div class="sub" style="display:flex;justify-content:space-between"><span>{_e(first)}</span>'
+        f'<span>近{len(points)}个交易日日K · 背景红=多头 绿=空头</span><span>{_e(last)}</span></div>'
+    )
+
+
 def _sparkline(series: list[dict]) -> str:
     """活跃市值走势：按当天多空状态给线段上色。"""
     points = [p for p in series if p.get("close")]
@@ -164,7 +207,7 @@ def _amv_card(amv: dict | None, behind: bool) -> str:
         f'<div class="meta">第 {amv["days_in_state"]} 天（自 {_e(since)}）· 当日 {_pct(amv["pct_chg"])}</div>'
         f'{stale}</div><div>'
         f'<div class="next">{"　".join(nexts)}</div>'
-        f'{_sparkline(amv.get("series", []))}'
+        f'{_amv_kline(amv.get("series", []))}'
         '<div class="sub" style="margin-top:4px">只作大盘背景，不否决选股和加仓。</div>'
         "</div></div>"
     )
